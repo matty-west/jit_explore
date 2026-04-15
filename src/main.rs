@@ -668,6 +668,234 @@ fn gate_7() {
 }
 
 // ╔══════════════════════════════════════╗
+// ║  Gate 8 — Waking the Matrix          ║
+// ╚══════════════════════════════════════╝
+
+fn gate_8() {
+    use crate::emitter::{SMSTART, SMSTOP};
+
+    println!("── gate 8: waking the matrix (SME enable) ──");
+
+    let probe = Probe::new();
+
+    // ── Test A: Probe SMSTART directly ──
+    //    SMSTART = MSR SVCRSM, #1 = 0xD503437F
+    //    sysctl says FEAT_SME=1, so this should NOT fault.
+    {
+        println!("  probing SMSTART (0x{SMSTART:08X})...");
+        let result = probe.run(SMSTART);
+        println!("    {result}");
+        if result.faulted {
+            println!("  ✗ SMSTART faulted — SME may require entitlements or kernel enable.");
+            println!("    sysctl reports FEAT_SME=1 but macOS may be guarding access.");
+            println!("    STOPPING gate 8 — investigate with Frida/Accelerate before retrying.");
+            return;
+        }
+        assert!(!result.timed_out, "SMSTART should not timeout");
+        assert!(!result.segfaulted, "SMSTART should not segfault");
+        println!("    ✓ SMSTART executed without fault — streaming mode entered");
+    }
+    println!();
+
+    // ── Test B: Probe SMSTOP ──
+    //    SMSTOP = MSR SVCRSM, #0 = 0xD503427F
+    //    Should always work after SMSTART.
+    {
+        println!("  probing SMSTOP (0x{SMSTOP:08X})...");
+        let result = probe.run(SMSTOP);
+        println!("    {result}");
+        assert!(!result.faulted, "SMSTOP should not fault");
+        println!("    ✓ SMSTOP executed — streaming mode exited");
+    }
+    println!();
+
+    // ── Test C: SMSTART in observed mode ──
+    //    Use run_observed_with_prefix to probe SMSTART *with* SMSTOP as a
+    //    suffix. Without the suffix the postlude executes in streaming SVE
+    //    mode — STP of X-regs technically still works, but on M4 the CPU
+    //    hangs (possibly an SVL-dependent pipeline stall). Adding SMSTOP as
+    //    suffix ensures the postlude runs in normal (non-streaming) mode.
+    {
+        println!("  observed probe: SMSTART (with SMSTOP suffix)");
+        let result = probe.run_observed_with_prefix(SMSTART, &[], &[SMSTOP]);
+        println!("    status: {}", result.base.status());
+        assert!(!result.base.faulted, "SMSTART should not fault in observed mode");
+
+        if result.diff.is_empty() {
+            println!("    no GPR changes (expected — SMSTART modifies PSTATE, not GPRs)");
+        } else {
+            println!("    GPR mutations (unexpected!):");
+            for d in &result.diff {
+                println!("      {d}");
+            }
+        }
+        println!("    ✓ SMSTART observed");
+    }
+    println!();
+
+    // ── Test D: Probe a known SME instruction ──
+    //    FMOPA ZA0.S, P0/M, Z0.S, Z0.S  =  0x80800000
+    //    This is a Streaming SVE outer product — requires streaming mode.
+    //
+    //    Step 1: Bare probe (no SMSTART) → should SIGILL.
+    //    Step 2: Manual 4-instruction sequence via run() to test raw execution.
+    //    Step 3: Observed probe with prefix/suffix (if step 2 passes).
+    {
+        const FMOPA_ZA0_S: u32 = 0x8080_0000;
+
+        // Step 1: without SMSTART — should fault.
+        println!("  probing FMOPA ZA0.S (0x{FMOPA_ZA0_S:08X}) WITHOUT SMSTART...");
+        let result_bare = probe.run(FMOPA_ZA0_S);
+        println!("    {result_bare}");
+
+        // Step 2: Manual sequence — write SMSTART + FMOPA + SMSTOP + RET
+        //         directly into the page and execute via call_void.
+        //         This bypasses the observed prelude/postlude entirely.
+        println!("  manual sequence: SMSTART → FMOPA → SMSTOP → RET...");
+        {
+            use crate::signal_handler::{
+                enable_longjmp, disable_longjmp, clear_probe_flags,
+                arm_alarm, disarm_alarm, did_sigill_fire, did_timeout,
+                did_segfault, did_trap, sigsetjmp, JMP_BUF,
+            };
+
+            let page = jit_page::JitPage::alloc(4096)
+                .expect("alloc page for manual FMOPA test");
+            crate::signal_handler::set_probe_bounds(
+                page.as_ptr() as u64,
+                page.as_ptr() as u64 + page.size() as u64,
+            );
+
+            page.make_writable();
+            page.write_instruction(0, SMSTART);
+            page.write_instruction(4, FMOPA_ZA0_S);
+            page.write_instruction(8, SMSTOP);
+            page.write_instruction(12, 0xD65F_03C0); // RET
+            page.make_executable();
+
+            set_escape_address(page.as_ptr() as u64 + 16);
+            clear_probe_flags();
+            arm_alarm(5_000); // 5ms timeout
+
+            let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
+            if ret == 0 {
+                enable_longjmp();
+                // SAFETY: Page contains SMSTART + FMOPA + SMSTOP + RET.
+                // Faults/hangs recover via siglongjmp.
+                unsafe { page.call_void(); }
+                disable_longjmp();
+            } else {
+                disable_longjmp();
+            }
+            disarm_alarm();
+
+            let faulted = did_sigill_fire();
+            let timed_out = did_timeout();
+            let segfaulted = did_segfault();
+            let trapped = did_trap();
+
+            if faulted {
+                println!("    SIGILL — FMOPA faults even with SMSTART");
+            } else if timed_out {
+                println!("    TIMEOUT — FMOPA hangs (5ms alarm fired)");
+            } else if segfaulted {
+                println!("    SEGV — FMOPA segfaults");
+            } else if trapped {
+                println!("    TRAP — FMOPA trapped");
+            } else {
+                println!("    ✓ FMOPA executed: SMSTART → FMOPA → SMSTOP → RET succeeded");
+            }
+
+            // Restore probe bounds to the shared probe's page.
+            crate::signal_handler::set_probe_bounds(
+                probe.page_ptr() as u64,
+                probe.page_ptr() as u64 + probe.page_size() as u64,
+            );
+        }
+
+        // Step 3: Observed probe with prefix/suffix — only if step 2 worked.
+        // (Deferred until we know the basic sequence works.)
+    }
+    println!();
+
+    // ── Test E: Mini sweep of SME encoding space ──
+    //    Use simple run() with manual SMSTART/SMSTOP wrapping.
+    //    SME outer products live around 0x80800000..0x80FFFFFF.
+    {
+        use crate::signal_handler::{
+            enable_longjmp, disable_longjmp, clear_probe_flags,
+            arm_alarm, disarm_alarm, did_sigill_fire, did_timeout,
+            did_segfault, did_trap, sigsetjmp, JMP_BUF,
+        };
+
+        let base: u32 = 0x8080_0000;
+        let count: u32 = 64;
+        println!("  mini sweep: SME space 0x{base:08X}..0x{:08X} ({count} opcodes)", base + count);
+
+        let page = jit_page::JitPage::alloc(4096)
+            .expect("alloc page for SME sweep");
+        crate::signal_handler::set_probe_bounds(
+            page.as_ptr() as u64,
+            page.as_ptr() as u64 + page.size() as u64,
+        );
+
+        let mut ok = 0u32;
+        let mut faulted = 0u32;
+        let mut timed_out_count = 0u32;
+        let mut other = 0u32;
+
+        for i in 0..count {
+            let opcode = base + i;
+
+            page.make_writable();
+            page.write_instruction(0, SMSTART);
+            page.write_instruction(4, opcode);
+            page.write_instruction(8, SMSTOP);
+            page.write_instruction(12, 0xD65F_03C0); // RET
+            page.make_executable();
+
+            set_escape_address(page.as_ptr() as u64 + 16);
+            clear_probe_flags();
+            arm_alarm(5_000);
+
+            let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
+            if ret == 0 {
+                enable_longjmp();
+                // SAFETY: Page contains SMSTART + opcode + SMSTOP + RET.
+                unsafe { page.call_void(); }
+                disable_longjmp();
+            } else {
+                disable_longjmp();
+            }
+            disarm_alarm();
+
+            if did_sigill_fire() {
+                faulted += 1;
+            } else if did_timeout() {
+                timed_out_count += 1;
+            } else if did_segfault() || did_trap() {
+                other += 1;
+            } else {
+                ok += 1;
+            }
+        }
+        println!("    {count} probed: {ok} ok, {faulted} SIGILL, {timed_out_count} timeout, {other} other");
+        if ok > 0 {
+            println!("    ✓ {ok} SME instructions executed with SMSTART/SMSTOP wrapping!");
+        }
+
+        // Restore probe bounds.
+        crate::signal_handler::set_probe_bounds(
+            probe.page_ptr() as u64,
+            probe.page_ptr() as u64 + probe.page_size() as u64,
+        );
+    }
+    println!();
+
+    println!("✓ matrix coprocessor probing operational\n");
+}
+
+// ╔══════════════════════════════════════╗
 // ║  Main                                ║
 // ╚══════════════════════════════════════╝
 
@@ -682,4 +910,5 @@ fn main() {
     // proved is now implicitly exercised by gate_6+.
     gate_6();
     gate_7();
+    gate_8();
 }

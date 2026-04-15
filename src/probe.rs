@@ -223,6 +223,16 @@ impl Probe {
         }
     }
 
+    /// Raw pointer to the start of the JIT page.
+    pub fn page_ptr(&self) -> *const u8 {
+        self.page.as_ptr()
+    }
+
+    /// Size of the JIT page in bytes.
+    pub fn page_size(&self) -> usize {
+        self.page.size()
+    }
+
     /// Probe a single opcode: write it + RET, execute, report.
     pub fn run(&self, opcode: u32) -> ProbeResult {
         // 1. Write the opcode under test at offset 0, RET at offset 4.
@@ -403,6 +413,123 @@ impl Probe {
                 seeds.diff(post_snap)
                     .into_iter()
                     .filter(|d| d.index < 28) // skip x28, x29, x30
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        ObservedProbeResult {
+            base,
+            pre: Some(seeds),
+            post,
+            diff,
+            snapshot_corrupted,
+        }
+    }
+
+    /// Probe a single opcode with a prefix/suffix instruction sequence.
+    ///
+    /// Layout: `prelude → prefix[] → opcode → suffix[] → postlude`
+    ///
+    /// The prefix runs *after* seeds are loaded (e.g., `SMSTART` to enable
+    /// streaming mode before the probed instruction). The suffix runs *before*
+    /// the postlude captures registers (e.g., `SMSTOP` to disable streaming
+    /// mode so the STP instructions in the postlude work correctly in
+    /// non-streaming mode).
+    ///
+    /// # Arguments
+    /// - `opcode`: The instruction under test.
+    /// - `prefix`: Instructions emitted before the opcode (e.g., `&[SMSTART]`).
+    /// - `suffix`: Instructions emitted after the opcode (e.g., `&[SMSTOP]`).
+    pub fn run_observed_with_prefix(
+        &self,
+        opcode: u32,
+        prefix: &[u32],
+        suffix: &[u32],
+    ) -> ObservedProbeResult {
+        let mut buf_pre = SnapshotBuffer::new();
+        let mut buf_post = SnapshotBuffer::new();
+
+        self.page.make_writable();
+
+        // Emit: prelude → prefix → opcode → suffix → postlude
+        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr());
+
+        for &inst in prefix {
+            self.page.write_instruction(off, inst);
+            off += 4;
+        }
+
+        self.page.write_instruction(off, opcode);
+        off += 4;
+
+        for &inst in suffix {
+            self.page.write_instruction(off, inst);
+            off += 4;
+        }
+
+        let _end = emitter::emit_postlude(
+            &self.page,
+            off,
+            buf_post.as_mut_ptr(),
+            buf_pre.as_mut_ptr(),
+        );
+
+        self.page.make_executable();
+
+        set_escape_address(self.page.as_ptr() as u64 + _end as u64);
+
+        clear_probe_flags();
+        if self.timeout_micros > 0 {
+            arm_alarm(self.timeout_micros);
+        }
+
+        let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
+        let _signal_fired = if ret == 0 {
+            enable_longjmp();
+            // SAFETY: The page contains a valid prelude → prefix → opcode →
+            // suffix → postlude → RET sequence. Faults recover via siglongjmp.
+            unsafe { self.page.call_void(); }
+            disable_longjmp();
+            false
+        } else {
+            disable_longjmp();
+            true
+        };
+
+        if self.timeout_micros > 0 {
+            disarm_alarm();
+        }
+
+        let faulted = did_sigill_fire();
+        let timed_out = did_timeout();
+        let segfaulted = did_segfault();
+        let trapped = did_trap();
+
+        let base = ProbeResult {
+            opcode,
+            faulted,
+            timed_out,
+            segfaulted,
+            trapped,
+        };
+
+        let pre_corrupted = !buf_pre.canaries_intact();
+        let post_corrupted = !buf_post.canaries_intact();
+        let snapshot_corrupted = pre_corrupted || post_corrupted;
+
+        let seeds = seeded_snapshot();
+        let post = if faulted || timed_out || segfaulted || trapped {
+            None
+        } else {
+            buf_post.to_snapshot()
+        };
+
+        let diff = match &post {
+            Some(post_snap) => {
+                seeds.diff(post_snap)
+                    .into_iter()
+                    .filter(|d| d.index < 28)
                     .collect()
             }
             _ => Vec::new(),

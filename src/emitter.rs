@@ -37,6 +37,49 @@ use crate::jit_page::JitPage;
 /// AArch64 RET — return to caller via x30 (LR).
 const RET: u32 = 0xD65F_03C0;
 
+// ╔══════════════════════════════════════╗
+// ║  SME enable / disable                ║
+// ╚══════════════════════════════════════╝
+
+/// `SMSTART` — enable **both** streaming SVE mode (SM) and ZA tile storage.
+///
+/// Encoding: `MSR SVCRSMZA, #3` → `0xD503_477F`.
+///
+/// After this instruction, both SVE streaming instructions and ZA tile
+/// operations (FMOPA, etc.) can execute.
+/// Must be paired with [`SMSTOP`] to restore normal mode.
+pub const SMSTART: u32 = 0xD503_477F;
+
+/// `SMSTOP` — disable **both** streaming SVE mode (SM) and ZA tile storage.
+///
+/// Encoding: `MSR SVCRSMZA, #0` → `0xD503_467F`.
+/// Returns the CPU to non-streaming mode with ZA disabled.
+pub const SMSTOP: u32 = 0xD503_467F;
+
+/// `SMSTART SM` — enable streaming SVE mode only (no ZA).
+///
+/// Encoding: `MSR SVCRSM, #1` → `0xD503_437F`.
+#[allow(dead_code)]
+pub const SMSTART_SM: u32 = 0xD503_437F;
+
+/// `SMSTOP SM` — disable streaming SVE mode only (no ZA).
+///
+/// Encoding: `MSR SVCRSM, #0` → `0xD503_427F`.
+#[allow(dead_code)]
+pub const SMSTOP_SM: u32 = 0xD503_427F;
+
+/// `SMSTART ZA` — enable ZA tile storage only (no streaming mode).
+///
+/// Encoding: `MSR SVCRZA, #1` → `0xD503_457F`.
+#[allow(dead_code)]
+pub const SMSTART_ZA: u32 = 0xD503_457F;
+
+/// `SMSTOP ZA` — disable ZA tile storage only.
+///
+/// Encoding: `MSR SVCRZA, #0` → `0xD503_447F`.
+#[allow(dead_code)]
+pub const SMSTOP_ZA: u32 = 0xD503_447F;
+
 /// Encode `STP Xt1, Xt2, [Xn, #imm7*8]` (64-bit, offset variant).
 ///
 /// Stores two 64-bit registers to `[Xn + imm7*8]`.
