@@ -896,6 +896,264 @@ fn gate_8() {
 }
 
 // ╔══════════════════════════════════════╗
+// ║  Gate 9 — Autonomous AMX/SME Sweep   ║
+// ╚══════════════════════════════════════╝
+
+fn gate_9() {
+    use std::path::Path;
+    use crate::emitter::{SMSTART, SMSTOP, encode_amx_store_tile};
+    use crate::probe::{Probe, ProbeClassification};
+    use crate::signal_handler::install_sigint_handler;
+    use crate::sink::ResultSink;
+
+    println!("── gate 9: autonomous AMX/SME sweep ──");
+
+    install_sigint_handler();
+
+    let output_dir = Path::new("output");
+    std::fs::create_dir_all(output_dir).expect("failed to create output/");
+
+    // ── Step 1: Validate AMX store encoding ──────────────────────────────────
+    // The corsix/amx reverse-engineered encoding has never been executed on this
+    // M4. Probe it in a fork before trusting it in the postlude.
+    println!("\n  [1/4] Validating AMX store tile encoding...");
+    let amx_encoding_valid = {
+        use crate::jit_page::JitPage;
+
+        // Allocate a 4KB scratch buffer in shared memory (mmap MAP_ANON | MAP_SHARED).
+        let scratch_size = 4096usize;
+        let scratch_buf = unsafe {
+            let ptr = libc::mmap(
+                std::ptr::null_mut(),
+                scratch_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_SHARED,
+                -1,
+                0,
+            );
+            assert!(ptr != libc::MAP_FAILED, "mmap scratch failed");
+            ptr as *mut u8
+        };
+
+        // Emit: SMSTART → load scratch addr into X0 → AMX_ST_TILE(T0, X0) → SMSTOP → RET
+        let page = JitPage::alloc(4096).expect("alloc validation page");
+        page.make_writable();
+        let mut off = 0usize;
+
+        // SMSTART
+        page.write_instruction(off, SMSTART); off += 4;
+
+        // MOVZ X0, #lo16(scratch_buf_ptr) ; MOVK for upper bits
+        let ptr_val = scratch_buf as u64;
+        let emit_movz = |rd: u8, imm16: u16, shift: u8| -> u32 {
+            let hw = (shift / 16) as u32;
+            0xD280_0000 | (hw << 21) | ((imm16 as u32) << 5) | (rd as u32)
+        };
+        let emit_movk = |rd: u8, imm16: u16, shift: u8| -> u32 {
+            let hw = (shift / 16) as u32;
+            0xF280_0000 | (hw << 21) | ((imm16 as u32) << 5) | (rd as u32)
+        };
+        // Load all 64 bits of scratch_buf into X0
+        let chunks: [u16; 4] = [
+            (ptr_val & 0xFFFF) as u16,
+            ((ptr_val >> 16) & 0xFFFF) as u16,
+            ((ptr_val >> 32) & 0xFFFF) as u16,
+            ((ptr_val >> 48) & 0xFFFF) as u16,
+        ];
+        page.write_instruction(off, emit_movz(0, chunks[0], 0));  off += 4;
+        if chunks[1] != 0 { page.write_instruction(off, emit_movk(0, chunks[1], 16)); off += 4; }
+        if chunks[2] != 0 { page.write_instruction(off, emit_movk(0, chunks[2], 32)); off += 4; }
+        if chunks[3] != 0 { page.write_instruction(off, emit_movk(0, chunks[3], 48)); off += 4; }
+
+        // AMX_ST_TILE(T0, X0)  — store tile 0 to [X0]
+        page.write_instruction(off, encode_amx_store_tile(0, 0)); off += 4;
+
+        // SMSTOP
+        page.write_instruction(off, SMSTOP); off += 4;
+
+        // RET
+        page.write_instruction(off, RET);
+        // off += 4; — last instruction, no need to advance offset further
+        page.make_executable();
+
+        let mut ok = false;
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::signal(libc::SIGILL,  libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS,  libc::SIG_DFL);
+                page.make_executable();
+                page.call_void();
+                libc::_exit(0);
+            } else if pid > 0 {
+                let mut status: libc::c_int = 0;
+                let start = std::time::Instant::now();
+                loop {
+                    let ret = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                    if ret == pid { break; }
+                    if start.elapsed() > std::time::Duration::from_millis(500) {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, &mut status, 0);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+                if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+                    ok = true;
+                }
+            } else {
+                panic!("fork failed");
+            }
+        }
+
+        // Free scratch buffer.
+        unsafe { libc::munmap(scratch_buf as *mut libc::c_void, scratch_size); }
+
+        ok
+    };
+
+    if amx_encoding_valid {
+        println!("    ✓ AMX store tile encoding validated — streaming postlude will capture tiles");
+    } else {
+        println!("    ✗ AMX store tile encoding INVALID (SIGILL or timeout)");
+        println!("      Streaming sweeps will still run but AMX tile capture is disabled.");
+        println!("      GPR-only observation is still valid for Gate 9.");
+    }
+
+    // ── Step 2: Define opcode ranges ─────────────────────────────────────────
+    // ALU baseline (streaming=false) — ADD variants.
+    let alu_range   = 0x8B00_0000u32..0x8B00_FFFFu32; // 64 K opcodes
+    // SME outer product space (streaming=true).
+    let sme_range   = 0x8080_0000u32..0x80FF_FFFFu32; // ~8 M opcodes
+    // Apple AMX instruction space (streaming=true, if encoding validated).
+    let amx_range   = 0x0020_0000u32..0x002F_FFFFu32; // ~1 M opcodes
+
+    let probe = Probe::new();
+
+    // ── Step 3: ALU baseline sweep (streaming=false) ─────────────────────────
+    println!("\n  [2/4] ALU baseline sweep (streaming=false): {:?} ({} opcodes)",
+        alu_range, alu_range.end - alu_range.start);
+    let alu_path = output_dir.join("gate9_alu.jsonl");
+    let _ = std::fs::remove_file(&alu_path);
+    {
+        let mut sink = ResultSink::new(&alu_path).expect("open alu sink");
+        let (summary, interrupted) = probe.observed_sweep(alu_range.clone(), &mut sink, 4096);
+        println!("    {summary}");
+        if interrupted { println!("    (interrupted)"); }
+        // Classification breakdown.
+        println!("    output: {}", alu_path.display());
+    }
+
+    // ── Step 4: SME sweep (streaming=true) ───────────────────────────────────
+    println!("\n  [3/4] SME sweep (streaming=true): {:?} (~{:.0}K opcodes)",
+        sme_range, (sme_range.end - sme_range.start) as f64 / 1000.0);
+    let sme_path = output_dir.join("gate9_sme.jsonl");
+    let resume_from = ResultSink::last_opcode(&sme_path)
+        .map(|op| op.saturating_add(1))
+        .unwrap_or(sme_range.start);
+    println!("    resuming from 0x{resume_from:08X}");
+    {
+        let mut sink = ResultSink::new(&sme_path).expect("open sme sink");
+        let opcodes = resume_from..sme_range.end;
+        let (summary, interrupted) = probe.observed_sweep_streaming(opcodes, &mut sink, 50_000);
+        println!("    {summary}");
+        if interrupted { println!("    (interrupted — resume supported)"); }
+        println!("    output: {}", sme_path.display());
+    }
+
+    // ── Step 5: AMX sweep (streaming=true, only if encoding validated) ────────
+    if amx_encoding_valid {
+        println!("\n  [4/4] AMX sweep (streaming=true): {:?} (~{:.0}K opcodes)",
+            amx_range, (amx_range.end - amx_range.start) as f64 / 1000.0);
+        let amx_path = output_dir.join("gate9_amx.jsonl");
+        let resume_from = ResultSink::last_opcode(&amx_path)
+            .map(|op| op.saturating_add(1))
+            .unwrap_or(amx_range.start);
+        println!("    resuming from 0x{resume_from:08X}");
+        {
+            let mut sink = ResultSink::new(&amx_path).expect("open amx sink");
+            let opcodes = resume_from..amx_range.end;
+            let (summary, interrupted) = probe.observed_sweep_streaming(opcodes, &mut sink, 50_000);
+            println!("    {summary}");
+            if interrupted { println!("    (interrupted — resume supported)"); }
+            println!("    output: {}", amx_path.display());
+        }
+    } else {
+        println!("\n  [4/4] AMX sweep SKIPPED (encoding unvalidated)");
+    }
+
+    // ── Step 6: Post-sweep classification summary ─────────────────────────────
+    println!("\n  ── Classification summary ──");
+
+    let mut classify_file = |label: &str, path: &std::path::PathBuf| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut undefined = 0u64;
+        let mut nop_like = 0u64;
+        let mut gpr_mutating = 0u64;
+        let mut amx_mutating = 0u64;
+        let mut gpr_amx = 0u64;
+        let mut mem_fault = 0u64;
+        let mut trapped_count = 0u64;
+        let mut hung = 0u64;
+        let mut interesting: Vec<String> = Vec::new();
+
+        for line in content.lines() {
+            if line.trim().is_empty() { continue; }
+            let Ok(rec) = serde_json::from_str::<crate::sink::SinkRecord>(line) else { continue };
+
+            // Re-classify from the record fields.
+            let classification = match rec.status.as_str() {
+                "SIGILL"  => ProbeClassification::Undefined,
+                "SEGV"    => ProbeClassification::MemoryFault,
+                "TRAP"    => ProbeClassification::Trapped,
+                "TIMEOUT" => ProbeClassification::Hung,
+                "ok"      => {
+                    let gpr_changed = !rec.diff.is_empty();
+                    let amx_ch = rec.amx_changed.unwrap_or(false);
+                    match (gpr_changed, amx_ch) {
+                        (false, false) => ProbeClassification::NopLike,
+                        (true,  false) => ProbeClassification::GprMutating,
+                        (false, true)  => ProbeClassification::AmxMutating,
+                        (true,  true)  => ProbeClassification::GprAndAmxMutating,
+                    }
+                }
+                _ => ProbeClassification::Undefined,
+            };
+
+            match classification {
+                ProbeClassification::Undefined        => undefined      += 1,
+                ProbeClassification::NopLike          => nop_like       += 1,
+                ProbeClassification::GprMutating      => { gpr_mutating  += 1; interesting.push(rec.opcode.clone()); }
+                ProbeClassification::AmxMutating      => { amx_mutating  += 1; interesting.push(rec.opcode.clone()); }
+                ProbeClassification::GprAndAmxMutating=> { gpr_amx       += 1; interesting.push(rec.opcode.clone()); }
+                ProbeClassification::MemoryFault      => mem_fault      += 1,
+                ProbeClassification::Trapped          => trapped_count  += 1,
+                ProbeClassification::Hung             => hung           += 1,
+            }
+        }
+        let total = undefined + nop_like + gpr_mutating + amx_mutating + gpr_amx + mem_fault + trapped_count + hung;
+        println!("  {label}: {total} total");
+        println!("    SIGILL={undefined}  NOP-like={nop_like}  GPR={gpr_mutating}  AMX={amx_mutating}  GPR+AMX={gpr_amx}  SEGV={mem_fault}  TRAP={trapped_count}  HANG={hung}");
+        if !interesting.is_empty() {
+            let show: Vec<_> = interesting.iter().take(20).collect();
+            println!("    interesting ({} total): {}", interesting.len(), show.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "));
+        }
+    };
+
+    classify_file("ALU baseline", &output_dir.join("gate9_alu.jsonl"));
+    classify_file("SME sweep",    &output_dir.join("gate9_sme.jsonl"));
+    if amx_encoding_valid {
+        classify_file("AMX sweep", &output_dir.join("gate9_amx.jsonl"));
+    }
+
+    println!("\n✓ gate 9 complete — sweep data in output/gate9_*.jsonl\n");
+}
+
+// ╔══════════════════════════════════════╗
 // ║  Main                                ║
 // ╚══════════════════════════════════════╝
 
@@ -911,4 +1169,5 @@ fn main() {
     gate_6();
     gate_7();
     gate_8();
+    gate_9();
 }

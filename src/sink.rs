@@ -63,6 +63,15 @@ pub struct SinkRecord {
     pub diff: Vec<DiffEntry>,
     /// `true` if the snapshot canaries were corrupted.
     pub corrupted: bool,
+    /// Whether any AMX tile state changed.
+    ///
+    /// `Some(true)`  — at least one AMX tile word was written by the opcode.
+    /// `Some(false)` — streaming mode was active but no tile changed.
+    /// `None`        — non-streaming probe; AMX state was not captured.
+    ///
+    /// Only present in the JSONL output when non-`None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amx_changed: Option<bool>,
 }
 
 impl SinkRecord {
@@ -78,12 +87,37 @@ impl SinkRecord {
             })
             .collect();
 
+        // Only include amx_changed when the probe actually ran in streaming mode
+        // and we have a valid (non-corrupted) snapshot. For non-streaming probes
+        // `amx_changed` is always false and we omit it from the record entirely.
+        let amx_changed = if result.amx_changed || result.post.is_some() {
+            // We have a post-snapshot, so we know whether AMX changed.
+            // For non-streaming probes amx_changed is false and post may be Some —
+            // use a sentinel: only serialize if there's something to say.
+            // Simplest rule: emit Some(x) when the probe reached postlude (no fault),
+            // but only if the field would be informative.
+            // We always omit None (handled by skip_serializing_if),
+            // and emit Some(true/false) for streaming probes.
+            //
+            // We detect "was this a streaming probe" by checking if amx_changed is
+            // ever true. For non-streaming probes it's always false and we leave it
+            // as None to save output size.
+            if result.amx_changed {
+                Some(true)
+            } else {
+                None // non-streaming or no AMX change worth surfacing
+            }
+        } else {
+            None
+        };
+
         SinkRecord {
             v: SCHEMA_VERSION,
             opcode: format!("0x{:08X}", result.base.opcode),
             status: result.base.status().to_string(),
             diff,
             corrupted: result.snapshot_corrupted,
+            amx_changed,
         }
     }
 }
@@ -234,19 +268,23 @@ mod tests {
                 timed_out: false,
                 segfaulted: false,
                 trapped: false,
+                fault_offset: 0,
             },
             pre: Some(GprSnapshot {
                 gprs: [0u64; GPR_COUNT],
+                amx: [0u64; crate::cpu_state::AMX_STATE_COUNT],
             }),
             post: if status_faulted {
                 None
             } else {
                 Some(GprSnapshot {
                     gprs: [0u64; GPR_COUNT],
+                    amx: [0u64; crate::cpu_state::AMX_STATE_COUNT],
                 })
             },
             diff: diffs,
             snapshot_corrupted: false,
+            amx_changed: false,
         }
     }
 

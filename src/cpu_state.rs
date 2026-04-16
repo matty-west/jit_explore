@@ -16,6 +16,11 @@ use std::fmt;
 /// Number of general-purpose registers captured (x0–x30).
 pub const GPR_COUNT: usize = 31;
 
+/// Number of 64-bit words in the AMX tile state.
+/// Apple AMX has 8 tiles (T0-T7), each is 64x64 bytes = 4096 bytes.
+/// Total state = 8 * 4096 = 32768 bytes = 4096 * 8-byte words.
+pub const AMX_STATE_COUNT: usize = 4096;
+
 /// Canary value written at the start of a snapshot buffer.
 /// If this is clobbered after a probe, the snapshot is corrupt.
 pub const CANARY_HEAD: u64 = 0xCAFE_BABE_DEAD_F00D;
@@ -49,13 +54,15 @@ pub const GPR_NAMES: [&str; GPR_COUNT] = [
 /// offset 0x100: canary_tail  (u64)
 /// ```
 ///
-/// Total size: 8 + (31 × 8) + 8 = 264 bytes.
+/// Total size: 8 + (31 × 8) + (4096 * 8) + 8 = 33032 bytes.
 #[repr(C, align(16))]
 pub struct SnapshotBuffer {
     /// Head canary — detect corruption from wild stores.
     pub canary_head: u64,
     /// The 31 GPRs: x0–x30.
     pub gprs: [u64; GPR_COUNT],
+    /// AMX tile state (8 tiles of 4KB each).
+    pub amx: [u64; AMX_STATE_COUNT],
     /// Tail canary — detect corruption from wild stores.
     pub canary_tail: u64,
 }
@@ -66,6 +73,7 @@ impl SnapshotBuffer {
         SnapshotBuffer {
             canary_head: CANARY_HEAD,
             gprs: [0u64; GPR_COUNT],
+            amx: [0u64; AMX_STATE_COUNT],
             canary_tail: CANARY_TAIL,
         }
     }
@@ -82,7 +90,10 @@ impl SnapshotBuffer {
     /// Returns `None` if the canaries are corrupted.
     pub fn to_snapshot(&self) -> Option<GprSnapshot> {
         if self.canaries_intact() {
-            Some(GprSnapshot { gprs: self.gprs })
+            Some(GprSnapshot {
+                gprs: self.gprs,
+                amx: self.amx,
+            })
         } else {
             None
         }
@@ -94,6 +105,11 @@ impl SnapshotBuffer {
     pub const fn gprs_offset() -> usize {
         // canary_head is 8 bytes, then gprs starts.
         std::mem::offset_of!(SnapshotBuffer, gprs)
+    }
+
+    /// Returns the byte offset of `amx[0]` from the start of the struct.
+    pub const fn amx_offset() -> usize {
+        std::mem::offset_of!(SnapshotBuffer, amx)
     }
 
     /// Returns a mutable pointer to the start of this buffer.
@@ -112,19 +128,22 @@ impl Default for SnapshotBuffer {
 // ║  GprSnapshot                         ║
 // ╚══════════════════════════════════════╝
 
-/// A snapshot of the 31 general-purpose registers (x0–x30).
+/// A snapshot of the 31 general-purpose registers (x0–x30) and AMX state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct GprSnapshot {
     /// Register values: `gprs[0]` = x0, ..., `gprs[30]` = x30.
     pub gprs: [u64; GPR_COUNT],
+    /// AMX tile state.
+    pub amx: [u64; AMX_STATE_COUNT],
 }
 
 impl GprSnapshot {
-    /// Create a snapshot with all registers zeroed.
+    /// Create a snapshot with all registers and AMX state zeroed.
     #[allow(dead_code)]
     pub fn zeroed() -> Self {
         GprSnapshot {
             gprs: [0u64; GPR_COUNT],
+            amx: [0u64; AMX_STATE_COUNT],
         }
     }
 
@@ -135,6 +154,15 @@ impl GprSnapshot {
     pub fn reg(&self, n: usize) -> u64 {
         assert!(n < GPR_COUNT, "register index {n} out of range (0..=30)");
         self.gprs[n]
+    }
+
+    /// Check whether any AMX tile state differs between `self` and `other`.
+    ///
+    /// Returns `true` if any word in the 32 KiB tile area changed.
+    /// Used by [`crate::probe::Probe::run_observed_streaming`] to populate
+    /// `ObservedProbeResult::amx_changed`.
+    pub fn amx_changed(&self, other: &GprSnapshot) -> bool {
+        self.amx != other.amx
     }
 
     /// Compute the diff between `self` (pre) and `other` (post).
@@ -240,7 +268,10 @@ pub fn seeded_snapshot() -> GprSnapshot {
     }
     // x28 = scratch (buf pointer), x29 = FP, x30 = LR — not seeded.
     // Left as 0.
-    GprSnapshot { gprs }
+    GprSnapshot {
+        gprs,
+        amx: [0u64; AMX_STATE_COUNT],
+    }
 }
 
 // ╔══════════════════════════════════════╗
@@ -255,8 +286,10 @@ mod tests {
     fn snapshot_buffer_layout() {
         // Verify the gprs offset is where we expect (after the 8-byte canary).
         assert_eq!(SnapshotBuffer::gprs_offset(), 8);
-        // Content: 8 + 31*8 + 8 = 264 bytes, rounded up to 272 by align(16).
-        assert_eq!(std::mem::size_of::<SnapshotBuffer>(), 272);
+        // Verify AMX offset.
+        assert_eq!(SnapshotBuffer::amx_offset(), 8 + 31 * 8);
+        // Content: 8 + 31*8 + 4096*8 + 8 = 33032 bytes.
+        assert_eq!(std::mem::size_of::<SnapshotBuffer>(), 33040); // 33032 rounded to 16-byte align
     }
 
     #[test]
@@ -279,6 +312,7 @@ mod tests {
     fn diff_detects_changes() {
         let pre = GprSnapshot {
             gprs: [0u64; GPR_COUNT],
+            amx: [0u64; AMX_STATE_COUNT],
         };
         let mut post = pre.clone();
         post.gprs[5] = 0x2A;  // x5 = 42
@@ -296,6 +330,7 @@ mod tests {
     fn diff_identical_is_empty() {
         let a = GprSnapshot {
             gprs: [42u64; GPR_COUNT],
+            amx: [0u64; AMX_STATE_COUNT],
         };
         assert!(a.diff(&a).is_empty());
     }

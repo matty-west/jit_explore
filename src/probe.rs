@@ -26,11 +26,50 @@ use std::time::Instant;
 use crate::cpu_state::{GprSnapshot, RegDiff, SnapshotBuffer, seeded_snapshot};
 use crate::emitter;
 use crate::jit_page::JitPage;
-use crate::signal_handler::{
-    arm_alarm, clear_probe_flags, did_segfault, did_sigill_fire, did_timeout, did_trap,
-    disarm_alarm, disable_longjmp, enable_longjmp, install_signal_handlers, set_escape_address,
-    sigsetjmp, JMP_BUF,
-};
+
+struct SharedMemory<T> {
+    ptr: *mut T,
+}
+
+impl<T> SharedMemory<T> {
+    fn new() -> Self {
+        let size = std::mem::size_of::<T>();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+        assert!(ptr != libc::MAP_FAILED, "Failed to mmap shared memory");
+        
+        // Zero initialize the memory (not strictly required if MAP_ANON zeros it, but good practice)
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, size);
+        }
+
+        Self { ptr: ptr as *mut T }
+    }
+
+    fn as_mut_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    fn get(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<T> Drop for SharedMemory<T> {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, std::mem::size_of::<T>());
+        }
+    }
+}
 
 // ╔══════════════════════════════════════╗
 // ║  Constants                           ║
@@ -56,6 +95,8 @@ pub struct ProbeResult {
     pub segfaulted: bool,
     /// `true` if the instruction caused a SIGTRAP (BRK / debug trap).
     pub trapped: bool,
+    /// The offset of the faulting instruction from the start of the batch (0 if not batched).
+    pub fault_offset: u32,
 }
 
 impl ProbeResult {
@@ -73,6 +114,15 @@ impl ProbeResult {
             "ok"
         }
     }
+}
+
+/// The outcome of probing a batch of opcodes.
+#[derive(Debug, Clone)]
+pub struct BatchProbeResult {
+    /// The opcodes that were tested.
+    pub opcodes: Vec<u32>,
+    /// Results for each opcode in the batch.
+    pub results: Vec<ProbeResult>,
 }
 
 impl fmt::Display for ProbeResult {
@@ -149,6 +199,61 @@ pub struct ObservedProbeResult {
     pub diff: Vec<RegDiff>,
     /// `true` if the snapshot canaries were corrupted (unreliable diff).
     pub snapshot_corrupted: bool,
+    /// `true` if any AMX tile state changed between pre and post snapshots.
+    /// Always `false` when the probe ran in non-streaming mode (no ZA state
+    /// is captured in that case). `None`-like sentinel — treat as `false`
+    /// unless the sweep was explicitly run in streaming mode.
+    pub amx_changed: bool,
+}
+
+// ╔══════════════════════════════════════╗
+// ║  ProbeClassification                 ║
+// ╚══════════════════════════════════════╝
+
+/// High-level classification of a single probe result.
+///
+/// Used by Gate 9 sweep summaries to identify candidate AMX/SME instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeClassification {
+    /// SIGILL — the opcode is not a real instruction (or is restricted).
+    Undefined,
+    /// Ok, no GPR diff, no AMX change — behaves like NOP.
+    NopLike,
+    /// Ok, GPR(s) changed but no AMX tile change.
+    GprMutating,
+    /// Ok, no GPR diff but AMX tile state changed.
+    AmxMutating,
+    /// Ok, both GPRs and AMX tiles changed.
+    GprAndAmxMutating,
+    /// SIGSEGV / SIGBUS — the instruction touches memory.
+    MemoryFault,
+    /// SIGTRAP — BRK or debug trap instruction.
+    Trapped,
+    /// TIMEOUT — instruction hung (infinite loop, WFI, etc.).
+    Hung,
+}
+
+impl ObservedProbeResult {
+    /// Classify this probe result into a [`ProbeClassification`].
+    pub fn classify(&self) -> ProbeClassification {
+        if self.base.timed_out {
+            ProbeClassification::Hung
+        } else if self.base.faulted {
+            ProbeClassification::Undefined
+        } else if self.base.segfaulted {
+            ProbeClassification::MemoryFault
+        } else if self.base.trapped {
+            ProbeClassification::Trapped
+        } else {
+            let gpr_changed = !self.diff.is_empty();
+            match (gpr_changed, self.amx_changed) {
+                (false, false) => ProbeClassification::NopLike,
+                (true, false)  => ProbeClassification::GprMutating,
+                (false, true)  => ProbeClassification::AmxMutating,
+                (true, true)   => ProbeClassification::GprAndAmxMutating,
+            }
+        }
+    }
 }
 
 impl fmt::Display for ObservedProbeResult {
@@ -196,12 +301,7 @@ impl Probe {
     /// # Panics
     /// Panics if the JIT page allocation fails.
     pub fn new() -> Self {
-        install_signal_handlers();
         let page = JitPage::alloc(4096).expect("failed to alloc JIT page for probe");
-        crate::signal_handler::set_probe_bounds(
-            page.as_ptr() as u64,
-            page.as_ptr() as u64 + page.size() as u64,
-        );
         Probe {
             page,
             timeout_micros: DEFAULT_TIMEOUT_MICROS,
@@ -211,12 +311,7 @@ impl Probe {
     /// Create a probe with no timeout (use with care — may hang on bad opcodes).
     #[allow(dead_code)]
     pub fn new_no_timeout() -> Self {
-        install_signal_handlers();
         let page = JitPage::alloc(4096).expect("failed to alloc JIT page for probe");
-        crate::signal_handler::set_probe_bounds(
-            page.as_ptr() as u64,
-            page.as_ptr() as u64 + page.size() as u64,
-        );
         Probe {
             page,
             timeout_micros: 0,
@@ -241,59 +336,182 @@ impl Probe {
         self.page.write_instruction(4, RET);
         self.page.make_executable();
 
-        // 2. Set escape address (needed by the SIGALRM handler's legacy
-        //    path, just in case, but longjmp takes priority).
-        set_escape_address(self.page.as_ptr() as u64 + 4);
+        let mut faulted = false;
+        let mut timed_out = false;
+        let mut segfaulted = false;
+        let mut trapped = false;
 
-        // 3. Clear flags, arm timeout.
-        clear_probe_flags();
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                // Child process
+                libc::signal(libc::SIGILL, libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGTRAP, libc::SIG_DFL);
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                self.page.make_executable(); // Ensure thread-local JIT state
+                
+                self.page.call_void();
+                libc::_exit(0);
+            } else if pid > 0 {
+                // Parent process
+                let mut status: libc::c_int = 0;
+                
+                // Increase timeout for debugging if it's too low
+                let effective_timeout = if self.timeout_micros > 0 && self.timeout_micros < 100_000 {
+                    100_000 // 100ms min for debug
+                } else {
+                    self.timeout_micros
+                };
 
-        if self.timeout_micros > 0 {
-            arm_alarm(self.timeout_micros);
-        }
+                if effective_timeout > 0 {
+                    let start = Instant::now();
+                    let timeout = std::time::Duration::from_micros(effective_timeout);
+                    
+                    loop {
+                        let ret = libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED);
+                        if ret == pid {
+                            break;
+                        } else if ret == -1 {
+                            break;
+                        }
+                        
+                        if start.elapsed() > timeout {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &mut status, 0);
+                            timed_out = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                } else {
+                    libc::waitpid(pid, &mut status, 0);
+                }
 
-        // 4. Use sigsetjmp / siglongjmp for recovery.
-        //
-        //    sigsetjmp(JMP_BUF, 1) saves the entire CPU state:
-        //      - All general-purpose registers (x0-x30/SP)
-        //      - Program counter
-        //      - Signal mask (the `1` argument)
-        //
-        //    If the probed instruction faults or hangs, the signal handler
-        //    calls siglongjmp(JMP_BUF, 1), which restores ALL of the above
-        //    and makes sigsetjmp return 1 instead of 0.
-        //
-        //    This elegantly handles ANY register clobbering.
-        let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
-        let _signal_fired = if ret == 0 {
-            // First return from sigsetjmp — execute the JIT code.
-            // Enable the siglongjmp path in signal handlers.
-            enable_longjmp();
-
-            // SAFETY: The page is in executable mode and contains the
-            // probed opcode + RET. If the instruction faults or hangs,
-            // the signal handler calls siglongjmp to recover.
-            unsafe { self.page.call_void(); }
-
-            disable_longjmp();
-            false
-        } else {
-            // Nonzero return: we got here via siglongjmp from a signal
-            // handler (fault or timeout). All registers restored by longjmp.
-            disable_longjmp();
-            true
-        };
-
-        if self.timeout_micros > 0 {
-            disarm_alarm();
+                if !timed_out {
+                    if libc::WIFSIGNALED(status) {
+                        let sig = libc::WTERMSIG(status);
+                        match sig {
+                            libc::SIGILL => faulted = true,
+                            libc::SIGSEGV | libc::SIGBUS => segfaulted = true,
+                            libc::SIGTRAP => trapped = true,
+                            _ => faulted = true, // Treat other signals as faults
+                        }
+                    }
+                }
+            } else {
+                panic!("fork failed");
+            }
         }
 
         ProbeResult {
             opcode,
-            faulted: did_sigill_fire(),
-            timed_out: did_timeout(),
-            segfaulted: did_segfault(),
-            trapped: did_trap(),
+            faulted,
+            timed_out,
+            segfaulted,
+            trapped,
+            fault_offset: 0,
+        }
+    }
+
+    /// Probe a batch of opcodes: write them + RET, execute, report.
+    pub fn run_batch(&self, opcodes: &[u32]) -> BatchProbeResult {
+        let count = opcodes.len();
+        self.page.make_writable();
+        for (i, &op) in opcodes.iter().enumerate() {
+            self.page.write_instruction(i * 4, op);
+        }
+        self.page.write_instruction(count * 4, RET);
+        self.page.make_executable();
+
+        let mut faulted = false;
+        let mut timed_out = false;
+        let mut segfaulted = false;
+        let mut trapped = false;
+
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::signal(libc::SIGILL, libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGTRAP, libc::SIG_DFL);
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                self.page.make_executable();
+                
+                self.page.call_void();
+                libc::_exit(0);
+            } else if pid > 0 {
+                let mut status: libc::c_int = 0;
+                let effective_timeout = if self.timeout_micros > 0 && self.timeout_micros < 100_000 {
+                    100_000
+                } else {
+                    self.timeout_micros
+                };
+
+                if effective_timeout > 0 {
+                    let start = Instant::now();
+                    let timeout = std::time::Duration::from_micros(effective_timeout);
+                    loop {
+                        let ret = libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED);
+                        if ret == pid {
+                            break;
+                        } else if ret == -1 {
+                            break;
+                        }
+                        if start.elapsed() > timeout {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &mut status, 0);
+                            timed_out = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                } else {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+
+                if !timed_out && libc::WIFSIGNALED(status) {
+                    let sig = libc::WTERMSIG(status);
+                    match sig {
+                        libc::SIGILL => faulted = true,
+                        libc::SIGSEGV | libc::SIGBUS => segfaulted = true,
+                        libc::SIGTRAP => trapped = true,
+                        _ => faulted = true,
+                    }
+                    // For batching, we would ideally get the PC from siginfo.
+                    // But in a separate process, we'd need ptrace or a signal handler
+                    // that communicates the PC back via shared memory.
+                    // For now, we assume the first instruction faulted if we can't get more info.
+                }
+            } else {
+                panic!("fork failed");
+            }
+        }
+
+        let mut results = Vec::with_capacity(count);
+        for (i, &opcode) in opcodes.iter().enumerate() {
+            let mut res = ProbeResult {
+                opcode,
+                faulted: false,
+                timed_out: false,
+                segfaulted: false,
+                trapped: false,
+                fault_offset: 0,
+            };
+            if i == 0 {
+                res.faulted = faulted;
+                res.timed_out = timed_out;
+                res.segfaulted = segfaulted;
+                res.trapped = trapped;
+            }
+            results.push(res);
+        }
+
+        BatchProbeResult {
+            opcodes: opcodes.to_vec(),
+            results,
         }
     }
 
@@ -330,58 +548,90 @@ impl Probe {
     /// This is slower than [`Probe::run`] due to the prelude/postlude overhead,
     /// but captures exactly which registers the instruction modified.
     pub fn run_observed(&self, opcode: u32) -> ObservedProbeResult {
-        // Allocate snapshot buffers on the stack.
-        let mut buf_pre = SnapshotBuffer::new();
-        let mut buf_post = SnapshotBuffer::new();
+        // Allocate snapshot buffers in shared memory.
+        let buf_pre = SharedMemory::<SnapshotBuffer>::new();
+        let buf_post = SharedMemory::<SnapshotBuffer>::new();
+        unsafe {
+            *buf_pre.as_mut_ptr() = SnapshotBuffer::new();
+            *buf_post.as_mut_ptr() = SnapshotBuffer::new();
+        }
 
         // Emit the full observed sequence into the JIT page:
         //   prelude → opcode → postlude
         self.page.make_writable();
 
-        let opcode_offset = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr());
+        // streaming=false: standard ALU/HINT sweeps — no SMSTART, no AMX capture.
+        let opcode_offset = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, false);
         self.page.write_instruction(opcode_offset, opcode);
         let postlude_offset = opcode_offset + 4;
         let _end = emitter::emit_postlude(
             &self.page,
             postlude_offset,
-            buf_post.as_mut_ptr(),
-            buf_pre.as_mut_ptr(),
+            buf_post.as_mut_ptr() as *mut u8,
+            buf_pre.as_mut_ptr() as *mut u8,
+            false,
         );
 
         self.page.make_executable();
 
-        // Set escape address past the sequence (just in case the legacy path fires).
-        set_escape_address(self.page.as_ptr() as u64 + _end as u64);
+        let mut faulted = false;
+        let mut timed_out = false;
+        let mut segfaulted = false;
+        let mut trapped = false;
 
-        // Clear flags, arm timeout.
-        clear_probe_flags();
-        if self.timeout_micros > 0 {
-            arm_alarm(self.timeout_micros);
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                // Child process
+                libc::signal(libc::SIGILL, libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGTRAP, libc::SIG_DFL);
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                self.page.make_executable(); // Ensure thread-local JIT state
+                self.page.call_void();
+                std::process::exit(0);
+            } else if pid > 0 {
+                // Parent process
+                let mut status: libc::c_int = 0;
+                
+                if self.timeout_micros > 0 {
+                    let wait_options = libc::WNOHANG;
+                    let start = Instant::now();
+                    let timeout = std::time::Duration::from_micros(self.timeout_micros);
+                    
+                    loop {
+                        let ret = libc::waitpid(pid, &mut status, wait_options);
+                        if ret == pid {
+                            break;
+                        }
+                        if start.elapsed() > timeout {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &mut status, 0);
+                            timed_out = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(10));
+                    }
+                } else {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+
+                if !timed_out {
+                    if libc::WIFSIGNALED(status) {
+                        let sig = libc::WTERMSIG(status);
+                        match sig {
+                            libc::SIGILL => faulted = true,
+                            libc::SIGSEGV | libc::SIGBUS => segfaulted = true,
+                            libc::SIGTRAP => trapped = true,
+                            _ => faulted = true,
+                        }
+                    }
+                }
+            } else {
+                panic!("fork failed");
+            }
         }
-
-        // Use sigsetjmp / siglongjmp for recovery.
-        let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
-        let _signal_fired = if ret == 0 {
-            enable_longjmp();
-            // SAFETY: The page is in executable mode and contains the full
-            // prelude → opcode → postlude → RET sequence. If the probed
-            // instruction faults or hangs, siglongjmp recovers.
-            unsafe { self.page.call_void(); }
-            disable_longjmp();
-            false
-        } else {
-            disable_longjmp();
-            true
-        };
-
-        if self.timeout_micros > 0 {
-            disarm_alarm();
-        }
-
-        let faulted = did_sigill_fire();
-        let timed_out = did_timeout();
-        let segfaulted = did_segfault();
-        let trapped = did_trap();
 
         let base = ProbeResult {
             opcode,
@@ -389,21 +639,19 @@ impl Probe {
             timed_out,
             segfaulted,
             trapped,
+            fault_offset: 0,
         };
 
         // Extract snapshots and compute diff.
-        // The "pre" for diffing is the known seed values (what the prelude loaded),
-        // NOT the caller's register state saved in buf_pre.
-        let pre_corrupted = !buf_pre.canaries_intact();
-        let post_corrupted = !buf_post.canaries_intact();
+        let pre_corrupted = !buf_pre.get().canaries_intact();
+        let post_corrupted = !buf_post.get().canaries_intact();
         let snapshot_corrupted = pre_corrupted || post_corrupted;
 
         let seeds = seeded_snapshot();
         let post = if faulted || timed_out || segfaulted || trapped {
-            // Post-snapshot is unreliable if the instruction didn't complete normally.
             None
         } else {
-            buf_post.to_snapshot()
+            buf_post.get().to_snapshot()
         };
 
         // Diff seeds vs post, but skip x28 (scratch), x29 (FP), x30 (LR)
@@ -424,6 +672,7 @@ impl Probe {
             post,
             diff,
             snapshot_corrupted,
+            amx_changed: false, // non-streaming: no AMX state captured
         }
     }
 
@@ -447,13 +696,18 @@ impl Probe {
         prefix: &[u32],
         suffix: &[u32],
     ) -> ObservedProbeResult {
-        let mut buf_pre = SnapshotBuffer::new();
-        let mut buf_post = SnapshotBuffer::new();
+        let buf_pre = SharedMemory::<SnapshotBuffer>::new();
+        let buf_post = SharedMemory::<SnapshotBuffer>::new();
+        unsafe {
+            *buf_pre.as_mut_ptr() = SnapshotBuffer::new();
+            *buf_post.as_mut_ptr() = SnapshotBuffer::new();
+        }
 
         self.page.make_writable();
 
-        // Emit: prelude → prefix → opcode → suffix → postlude
-        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr());
+        // Emit: prelude(streaming=false) → prefix → opcode → suffix → postlude(streaming=false)
+        // Callers that need streaming mode should use run_observed_streaming() instead.
+        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, false);
 
         for &inst in prefix {
             self.page.write_instruction(off, inst);
@@ -471,40 +725,70 @@ impl Probe {
         let _end = emitter::emit_postlude(
             &self.page,
             off,
-            buf_post.as_mut_ptr(),
-            buf_pre.as_mut_ptr(),
+            buf_post.as_mut_ptr() as *mut u8,
+            buf_pre.as_mut_ptr() as *mut u8,
+            false,
         );
 
         self.page.make_executable();
 
-        set_escape_address(self.page.as_ptr() as u64 + _end as u64);
+        let mut faulted = false;
+        let mut timed_out = false;
+        let mut segfaulted = false;
+        let mut trapped = false;
 
-        clear_probe_flags();
-        if self.timeout_micros > 0 {
-            arm_alarm(self.timeout_micros);
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::signal(libc::SIGILL, libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::signal(libc::SIGTRAP, libc::SIG_DFL);
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                self.page.make_executable(); // Ensure thread-local JIT state
+                self.page.call_void();
+                std::process::exit(0);
+            } else if pid > 0 {
+                let mut status: libc::c_int = 0;
+                let mut wait_options = 0;
+                
+                if self.timeout_micros > 0 {
+                    wait_options = libc::WNOHANG;
+                    let start = Instant::now();
+                    let timeout = std::time::Duration::from_micros(self.timeout_micros);
+                    
+                    loop {
+                        let ret = libc::waitpid(pid, &mut status, wait_options);
+                        if ret == pid {
+                            break;
+                        }
+                        if start.elapsed() > timeout {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &mut status, 0);
+                            timed_out = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(10));
+                    }
+                } else {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+
+                if !timed_out {
+                    if libc::WIFSIGNALED(status) {
+                        let sig = libc::WTERMSIG(status);
+                        match sig {
+                            libc::SIGILL => faulted = true,
+                            libc::SIGSEGV | libc::SIGBUS => segfaulted = true,
+                            libc::SIGTRAP => trapped = true,
+                            _ => faulted = true,
+                        }
+                    }
+                }
+            } else {
+                panic!("fork failed");
+            }
         }
-
-        let ret = sigsetjmp(JMP_BUF.as_mut_ptr(), 1);
-        let _signal_fired = if ret == 0 {
-            enable_longjmp();
-            // SAFETY: The page contains a valid prelude → prefix → opcode →
-            // suffix → postlude → RET sequence. Faults recover via siglongjmp.
-            unsafe { self.page.call_void(); }
-            disable_longjmp();
-            false
-        } else {
-            disable_longjmp();
-            true
-        };
-
-        if self.timeout_micros > 0 {
-            disarm_alarm();
-        }
-
-        let faulted = did_sigill_fire();
-        let timed_out = did_timeout();
-        let segfaulted = did_segfault();
-        let trapped = did_trap();
 
         let base = ProbeResult {
             opcode,
@@ -512,17 +796,18 @@ impl Probe {
             timed_out,
             segfaulted,
             trapped,
+            fault_offset: 0,
         };
 
-        let pre_corrupted = !buf_pre.canaries_intact();
-        let post_corrupted = !buf_post.canaries_intact();
+        let pre_corrupted = !buf_pre.get().canaries_intact();
+        let post_corrupted = !buf_post.get().canaries_intact();
         let snapshot_corrupted = pre_corrupted || post_corrupted;
 
         let seeds = seeded_snapshot();
         let post = if faulted || timed_out || segfaulted || trapped {
             None
         } else {
-            buf_post.to_snapshot()
+            buf_post.get().to_snapshot()
         };
 
         let diff = match &post {
@@ -541,7 +826,190 @@ impl Probe {
             post,
             diff,
             snapshot_corrupted,
+            amx_changed: false, // non-streaming: no AMX state captured
         }
+    }
+
+    /// Probe a single opcode in **streaming SVE mode** with full GPR + AMX snapshot.
+    ///
+    /// Layout: `prelude(streaming=true) → opcode → postlude(streaming=true)`
+    ///
+    /// The prelude emits `SMSTART` before the opcode; the postlude stores all
+    /// 8 AMX tiles and emits `SMSTOP` before restoring caller state.
+    /// Use this for SME/AMX sweeps — not for standard ALU/HINT sweeps where
+    /// `streaming=false` is correct.
+    pub fn run_observed_streaming(&self, opcode: u32) -> ObservedProbeResult {
+        let buf_pre  = SharedMemory::<SnapshotBuffer>::new();
+        let buf_post = SharedMemory::<SnapshotBuffer>::new();
+        unsafe {
+            *buf_pre.as_mut_ptr()  = SnapshotBuffer::new();
+            *buf_post.as_mut_ptr() = SnapshotBuffer::new();
+        }
+
+        self.page.make_writable();
+
+        // streaming=true: SMSTART before opcode, AMX capture + SMSTOP in postlude.
+        let opcode_offset = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, true);
+        self.page.write_instruction(opcode_offset, opcode);
+        let postlude_offset = opcode_offset + 4;
+        let _end = emitter::emit_postlude(
+            &self.page,
+            postlude_offset,
+            buf_post.as_mut_ptr() as *mut u8,
+            buf_pre.as_mut_ptr()  as *mut u8,
+            true,
+        );
+
+        self.page.make_executable();
+
+        let mut faulted = false;
+        let mut timed_out = false;
+        let mut segfaulted = false;
+        let mut trapped = false;
+
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::signal(libc::SIGILL,  libc::SIG_DFL);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS,  libc::SIG_DFL);
+                libc::signal(libc::SIGTRAP, libc::SIG_DFL);
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                self.page.make_executable();
+                self.page.call_void();
+                std::process::exit(0);
+            } else if pid > 0 {
+                let mut status: libc::c_int = 0;
+
+                if self.timeout_micros > 0 {
+                    let start = Instant::now();
+                    let timeout = std::time::Duration::from_micros(self.timeout_micros);
+                    loop {
+                        let ret = libc::waitpid(pid, &mut status, libc::WNOHANG);
+                        if ret == pid { break; }
+                        if start.elapsed() > timeout {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &mut status, 0);
+                            timed_out = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(10));
+                    }
+                } else {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+
+                if !timed_out && libc::WIFSIGNALED(status) {
+                    match libc::WTERMSIG(status) {
+                        libc::SIGILL             => faulted    = true,
+                        libc::SIGSEGV | libc::SIGBUS => segfaulted = true,
+                        libc::SIGTRAP            => trapped    = true,
+                        _                        => faulted    = true,
+                    }
+                }
+            } else {
+                panic!("fork failed");
+            }
+        }
+
+        let base = ProbeResult { opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0 };
+
+        let pre_corrupted  = !buf_pre.get().canaries_intact();
+        let post_corrupted = !buf_post.get().canaries_intact();
+        let snapshot_corrupted = pre_corrupted || post_corrupted;
+
+        let seeds = seeded_snapshot();
+        let post = if faulted || timed_out || segfaulted || trapped {
+            None
+        } else {
+            buf_post.get().to_snapshot()
+        };
+
+        // GPR diff (skip x28/x29/x30 — framework registers).
+        let diff = match &post {
+            Some(post_snap) => seeds.diff(post_snap)
+                .into_iter()
+                .filter(|d| d.index < 28)
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // AMX diff — compare tile arrays between seeds (all-zero) and post snapshot.
+        // The seeds snapshot has amx=[0; AMX_STATE_COUNT], so any non-zero tile byte
+        // in the post snapshot means the opcode wrote to a tile.
+        let amx_changed = match (&post, snapshot_corrupted) {
+            (Some(post_snap), false) => seeds.amx_changed(post_snap),
+            _ => false,
+        };
+
+        ObservedProbeResult {
+            base,
+            pre: Some(seeds),
+            post,
+            diff,
+            snapshot_corrupted,
+            amx_changed,
+        }
+    }
+
+    /// Sweep opcodes in **streaming mode** with full GPR + AMX snapshots.
+    ///
+    /// Like [`observed_sweep`] but calls [`run_observed_streaming`] for each opcode.
+    /// Use for SME and AMX encoding sweeps.
+    pub fn observed_sweep_streaming(
+        &self,
+        opcodes: impl Iterator<Item = u32>,
+        sink: &mut crate::sink::ResultSink,
+        progress_interval: usize,
+    ) -> (SweepSummary, bool) {
+        use crate::signal_handler::was_interrupted;
+
+        let start = Instant::now();
+        let mut ok = 0usize;
+        let mut faulted = 0usize;
+        let mut timed_out = 0usize;
+        let mut segfaulted = 0usize;
+        let mut trapped = 0usize;
+        let mut total = 0usize;
+        let mut interrupted = false;
+
+        for opcode in opcodes {
+            if was_interrupted() {
+                interrupted = true;
+                break;
+            }
+
+            let result = self.run_observed_streaming(opcode);
+
+            if result.base.timed_out       { timed_out  += 1; }
+            else if result.base.faulted    { faulted    += 1; }
+            else if result.base.segfaulted { segfaulted += 1; }
+            else if result.base.trapped    { trapped    += 1; }
+            else                           { ok         += 1; }
+
+            if let Err(e) = sink.write(&result) {
+                eprintln!("warning: sink write failed: {e}");
+            }
+
+            total += 1;
+
+            if progress_interval > 0 && total % progress_interval == 0 {
+                let elapsed = start.elapsed();
+                let rate = total as f64 / elapsed.as_secs_f64();
+                eprint!(
+                    "\r  {total} probed ({ok} ok, {faulted} SIGILL, {segfaulted} SEGV, {trapped} TRAP, {timed_out} TIMEOUT) [{rate:.0} ops/sec]"
+                );
+            }
+        }
+
+        if total > 0 { eprintln!(); }
+        if let Err(e) = sink.flush() { eprintln!("warning: sink flush failed: {e}"); }
+
+        let summary = SweepSummary {
+            total, ok, faulted, timed_out, segfaulted, trapped,
+            elapsed: start.elapsed(),
+        };
+        (summary, interrupted)
     }
 
     /// Sweep opcodes with full GPR snapshots, writing each result to a sink.

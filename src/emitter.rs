@@ -206,6 +206,19 @@ fn emit_load_imm64(page: &JitPage, offset: &mut usize, rd: u8, value: u64) -> us
 /// The byte offset within [`SnapshotBuffer`] where the GPR array starts.
 const GPRS_OFFSET: usize = SnapshotBuffer::gprs_offset();
 
+/// The byte offset within [`SnapshotBuffer`] where the AMX state starts.
+const AMX_OFFSET: usize = SnapshotBuffer::amx_offset();
+
+/// Encode `AMX_ST_TILE_T(n)` — store AMX tile `n` to `[Xn]`.
+///
+/// Encoding: `0x0020_8000 | (tile_index << 0) | (rn << 5)`
+///
+/// This encoding is from community reverse-engineering (corsix/amx) and must
+/// be validated before use — see Gate 9 AMX validation probe.
+pub const fn encode_amx_store_tile(tile_index: u8, rn: u8) -> u32 {
+    0x0020_8000 | (tile_index as u32) | ((rn as u32) << 5)
+}
+
 /// Emit the **prelude** sequence into the JIT page.
 ///
 /// The prelude:
@@ -215,13 +228,21 @@ const GPRS_OFFSET: usize = SnapshotBuffer::gprs_offset();
 /// 4. Saves SP into `buf_pre.gprs[28]` position is already taken — we store SP
 ///    separately if needed. For now, SP is saved via the sigsetjmp path.
 /// 5. Loads all GPRs (x0–x27) with deterministic seed values.
+/// 6. Optionally enables streaming SVE mode + ZA tile storage (`SMSTART`) if
+///    `streaming == true`. This must be matched by `streaming == true` in
+///    [`emit_postlude`] so the CPU is back in normal mode before the postlude
+///    runs its STP instructions.
 ///
 /// Returns the byte offset of the next free instruction slot.
 ///
 /// # Arguments
 /// - `page`: The JIT page (must be in writable mode).
 /// - `buf_pre_ptr`: Pointer to the `SnapshotBuffer` for the pre-probe dump.
-pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8) -> usize {
+/// - `streaming`: If `true`, emit `SMSTART` at the end of the prelude so the
+///   probed instruction runs in streaming SVE mode with ZA enabled. Use
+///   `false` for all non-SME sweeps (standard ALU, HINT, etc.) to avoid
+///   false-positive SIGILLs caused by the streaming-mode instruction subset.
+pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8, streaming: bool) -> usize {
     let mut off = 0usize;
     
     // Step 1: Push X28, X30 to stack (pre-indexed: SP -= 16, then store).
@@ -277,6 +298,16 @@ pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8) -> usize {
         emit_load_imm64(page, &mut off, reg, seed_value(reg));
     }
 
+    // ── Step 9: Conditionally enable AMX/SME ──
+    // Only emit SMSTART for streaming-mode sweeps. For standard ALU/HINT sweeps
+    // we leave the CPU in normal mode — unconditional SMSTART would cause massive
+    // false-positive SIGILLs because most standard instructions are illegal in
+    // streaming SVE mode.
+    if streaming {
+        page.write_instruction(off, SMSTART);
+        off += 4;
+    }
+
     off
 }
 
@@ -284,8 +315,9 @@ pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8) -> usize {
 ///
 /// The postlude:
 /// 1. Dumps X0–X27 into `buf_post.gprs[]` via X28 (still holding buf_post ptr).
-/// 2. Restores X29, X30 from `buf_pre` (saved by prelude).
-/// 3. Executes RET.
+/// 2. Optionally captures AMX tile state and emits `SMSTOP` (when `streaming == true`).
+/// 3. Restores X29, X30 from `buf_pre` (saved by prelude).
+/// 4. Executes RET.
 ///
 /// Returns the byte offset of the next free instruction slot (past the RET).
 ///
@@ -294,11 +326,15 @@ pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8) -> usize {
 /// - `start_offset`: Byte offset where the postlude begins.
 /// - `buf_post_ptr`: Pointer to the `SnapshotBuffer` for the post-probe dump.
 /// - `buf_pre_ptr`: Pointer to the pre-probe buffer (to restore X29, X30).
+/// - `streaming`: Must match the value passed to [`emit_prelude`]. When `true`,
+///   the postlude stores AMX tiles T0–T7 to `buf_post.amx` and then emits
+///   `SMSTOP` to return to normal mode before the STP restore sequence.
 pub fn emit_postlude(
     page: &JitPage,
     start_offset: usize,
     buf_post_ptr: *mut u8,
     buf_pre_ptr: *mut u8,
+    streaming: bool,
 ) -> usize {
     let mut off = start_offset;
 
@@ -337,7 +373,37 @@ pub fn emit_postlude(
         off += 4;
     }
 
-    // ── Step 2: Restore X29, X30 from buf_pre ──
+    // ── Step 2: Conditionally capture AMX state and disable streaming mode ──
+    // Only emit the AMX tile stores + SMSTOP when `streaming == true`.
+    // In non-streaming mode the CPU has no ZA state and these instructions
+    // would be undefined. The `streaming` flag must match what was passed to
+    // `emit_prelude` so the SMSTART/SMSTOP pair is balanced.
+    if streaming {
+        // AMX tiles T0-T7 are stored to buf_post.amx[].
+        // Each tile is 64x64 = 4KB. X28 currently holds buf_post_ptr.
+        for tile in 0..8u8 {
+            // Tile `tile` lives at AMX_OFFSET + tile*4096 within the buffer.
+            let tile_offset = AMX_OFFSET + (tile as usize * 4096);
+
+            // Load the tile destination address into X0 (already saved above).
+            // X0 = buf_post_ptr + tile_offset
+            emit_load_imm64(page, &mut off, 0, tile_offset as u64);
+
+            // ADD X0, X0, X28  →  X0 = X28 (buf_post_ptr) + tile_offset
+            // Encoding: 0x8B1C_0000
+            page.write_instruction(off, 0x8B1C_0000);
+            off += 4;
+
+            page.write_instruction(off, encode_amx_store_tile(tile, 0));
+            off += 4;
+        }
+
+        // SMSTOP — return CPU to non-streaming mode before the STP restore.
+        page.write_instruction(off, SMSTOP);
+        off += 4;
+    }
+
+    // ── Step 3: Restore X29, X30 from buf_pre ──
     // Load buf_pre base into X28 (scratch).
     emit_load_imm64(page, &mut off, 28, buf_pre_ptr as u64);
 
@@ -417,14 +483,27 @@ mod tests {
     }
 
     #[test]
-    fn prelude_fits_in_page() {
+    fn prelude_fits_in_page_non_streaming() {
         let page = JitPage::alloc(4096).expect("alloc");
         let mut buf = crate::cpu_state::SnapshotBuffer::new();
         page.make_writable();
-        let end = emit_prelude(&page, buf.as_mut_ptr());
+        let end = emit_prelude(&page, buf.as_mut_ptr(), false);
         assert!(
             end < 4096 - 256,
-            "prelude used {end} bytes, not enough room for postlude"
+            "prelude (non-streaming) used {end} bytes, not enough room for postlude"
+        );
+    }
+
+    #[test]
+    fn prelude_fits_in_page_streaming() {
+        let page = JitPage::alloc(4096).expect("alloc");
+        let mut buf = crate::cpu_state::SnapshotBuffer::new();
+        page.make_writable();
+        // Streaming adds 1 extra instruction (SMSTART).
+        let end = emit_prelude(&page, buf.as_mut_ptr(), true);
+        assert!(
+            end < 4096 - 256,
+            "prelude (streaming) used {end} bytes, not enough room for postlude"
         );
     }
 }
