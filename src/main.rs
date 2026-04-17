@@ -15,9 +15,7 @@ use signal_handler::{
     set_escape_address,
 };
 
-// ╔══════════════════════════════════════╗
-// ║  AArch64 Instruction Constants       ║
-// ╚══════════════════════════════════════╝
+// --- AArch64 Instruction Constants ---
 
 /// AArch64 NOP — no operation.
 #[allow(dead_code)]
@@ -30,9 +28,7 @@ const RET: u32 = 0xD65F_03C0;
 #[allow(dead_code)]
 const UDF_0: u32 = 0x0000_0000;
 
-// ╔══════════════════════════════════════╗
-// ║  AArch64 Instruction Encoding Helpers║
-// ╚══════════════════════════════════════╝
+// --- AArch64 Instruction Encoding Helpers ---
 
 /// Encode `MOVZ Xd, #imm16` — move a 16-bit immediate into a 64-bit register,
 /// zeroing the rest.
@@ -58,9 +54,7 @@ const fn encode_add_x(rd: u8, rn: u8, rm: u8) -> u32 {
     0x8B00_0000 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32)
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 0 — Minimal Viable Toolchain   ║
-// ╚══════════════════════════════════════╝
+// --- Gate 0: Minimal Viable Toolchain ---
 
 fn gate_0() {
     println!("── gate 0: inline asm toolchain ──");
@@ -72,9 +66,7 @@ fn gate_0() {
     println!("alive\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 1 — Allocate an Executable Page║
-// ╚══════════════════════════════════════╝
+// --- Gate 1: Allocate an Executable Page ---
 
 fn gate_1() {
     println!("── gate 1: allocate a JIT page ──");
@@ -111,9 +103,7 @@ fn gate_1() {
     // Page is dropped here → munmap cleans up.
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 2 — Execute a RET             ║
-// ╚══════════════════════════════════════╝
+// --- Gate 2: Execute a RET ---
 
 fn gate_2() {
     println!("── gate 2: execute a RET from JIT buffer ──");
@@ -137,9 +127,7 @@ fn gate_2() {
     println!("✓ Rust → JIT buffer → Rust round-trip succeeded\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 3 — Execute Something Useful   ║
-// ╚══════════════════════════════════════╝
+// --- Gate 3: Execute Something Useful ---
 
 fn gate_3() {
     println!("── gate 3: execute instructions that do something ──");
@@ -220,9 +208,7 @@ fn gate_3() {
     println!("✓ arbitrary runtime-emitted instructions execute and return values\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 4 — SIGILL Recovery            ║
-// ╚══════════════════════════════════════╝
+// --- Gate 4: SIGILL Recovery ---
 
 fn gate_4() {
     println!("── gate 4: SIGILL recovery ──");
@@ -331,9 +317,7 @@ fn gate_4() {
     println!("✓ SIGILL handler installed, UDF survived, execution continues\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 5 — The Execution Harness      ║
-// ╚══════════════════════════════════════╝
+// --- Gate 5: The Execution Harness ---
 
 #[allow(dead_code)]
 fn gate_5() {
@@ -430,9 +414,7 @@ fn gate_5() {
     println!("✓ probe harness operational — can sweep arbitrary opcode ranges\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 6 — Register Snapshot Observer ║
-// ╚══════════════════════════════════════╝
+// --- Gate 6: Register Snapshot Observer ---
 
 fn gate_6() {
     println!("── gate 6: register snapshot observer ──");
@@ -524,9 +506,7 @@ fn gate_6() {
     println!("✓ register snapshot observer operational\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 7 — The Data Sink              ║
-// ╚══════════════════════════════════════╝
+// --- Gate 7: The Data Sink ---
 
 fn gate_7() {
     use std::path::Path;
@@ -667,9 +647,7 @@ fn gate_7() {
     println!("✓ data sink operational — JSONL logging with resume\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 8 — Waking the Matrix          ║
-// ╚══════════════════════════════════════╝
+// --- Gate 8: Waking the Matrix ---
 
 fn gate_8() {
     use crate::emitter::{SMSTART, SMSTOP};
@@ -895,9 +873,7 @@ fn gate_8() {
     println!("✓ matrix coprocessor probing operational\n");
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Gate 9 — Autonomous AMX/SME Sweep   ║
-// ╚══════════════════════════════════════╝
+// --- Gate 9: Autonomous AMX/SME Sweep ---
 
 fn gate_9() {
     use std::path::Path;
@@ -1152,10 +1128,6 @@ fn gate_9() {
 
     println!("\n✓ gate 9 complete — sweep data in output/gate9_*.jsonl\n");
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Main                                ║
-// ╚══════════════════════════════════════╝
 
 fn main() {
     gate_0();

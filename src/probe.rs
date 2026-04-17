@@ -1,7 +1,3 @@
-// ╔══════════════════════════════════════╗
-// ║  probe — opcode execution harness    ║
-// ╚══════════════════════════════════════╝
-//
 //! Reusable harness for probing arbitrary AArch64 opcodes.
 //!
 //! Given a `u32` opcode, the harness writes it into a JIT page followed by
@@ -71,16 +67,8 @@ impl<T> Drop for SharedMemory<T> {
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Constants                           ║
-// ╚══════════════════════════════════════╝
-
 /// AArch64 RET — return to caller via x30 (LR).
 const RET: u32 = 0xD65F_03C0;
-
-// ╔══════════════════════════════════════╗
-// ║  ProbeResult                         ║
-// ╚══════════════════════════════════════╝
 
 /// The outcome of probing a single opcode.
 #[derive(Debug, Clone)]
@@ -138,10 +126,6 @@ impl fmt::Display for ProbeResult {
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  SweepSummary                        ║
-// ╚══════════════════════════════════════╝
-
 /// Summary statistics from a sweep over a range of opcodes.
 #[derive(Debug, Clone)]
 pub struct SweepSummary {
@@ -177,10 +161,6 @@ impl fmt::Display for SweepSummary {
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  ObservedProbeResult                 ║
-// ╚══════════════════════════════════════╝
-
 /// The outcome of a probe with full register snapshot.
 ///
 /// Extends [`ProbeResult`] with before/after GPR state and a diff.
@@ -205,10 +185,6 @@ pub struct ObservedProbeResult {
     /// unless the sweep was explicitly run in streaming mode.
     pub amx_changed: bool,
 }
-
-// ╔══════════════════════════════════════╗
-// ║  ProbeClassification                 ║
-// ╚══════════════════════════════════════╝
 
 /// High-level classification of a single probe result.
 ///
@@ -272,10 +248,6 @@ impl fmt::Display for ObservedProbeResult {
         Ok(())
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Probe                               ║
-// ╚══════════════════════════════════════╝
 
 /// Reusable opcode probe harness.
 ///
@@ -1101,10 +1073,6 @@ impl fmt::Debug for Probe {
         write!(f, "Probe {{ page: {:?} }}", self.page)
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Tests                               ║
-// ╚══════════════════════════════════════╝
 
 #[cfg(test)]
 mod tests {

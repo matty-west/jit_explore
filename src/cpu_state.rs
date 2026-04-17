@@ -1,7 +1,3 @@
-// ╔══════════════════════════════════════╗
-// ║  cpu_state — register snapshots      ║
-// ╚══════════════════════════════════════╝
-//
 //! Types for capturing and diffing AArch64 CPU register state.
 //!
 //! The [`GprSnapshot`] type holds the 31 general-purpose registers (x0–x30)
@@ -9,9 +5,7 @@
 
 use std::fmt;
 
-// ╔══════════════════════════════════════╗
-// ║  Constants                           ║
-// ╚══════════════════════════════════════╝
+// --- Constants ---
 
 /// Number of general-purpose registers captured (x0–x30).
 pub const GPR_COUNT: usize = 31;
@@ -35,10 +29,6 @@ pub const GPR_NAMES: [&str; GPR_COUNT] = [
     "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
     "x24", "x25", "x26", "x27", "x28", "x29", "x30",
 ];
-
-// ╔══════════════════════════════════════╗
-// ║  SnapshotBuffer                      ║
-// ╚══════════════════════════════════════╝
 
 /// Memory layout for a single register dump, including canary values.
 ///
@@ -123,10 +113,6 @@ impl Default for SnapshotBuffer {
         Self::new()
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  GprSnapshot                         ║
-// ╚══════════════════════════════════════╝
 
 /// A snapshot of the 31 general-purpose registers (x0–x30) and AMX state.
 #[derive(Clone, PartialEq, Eq)]
@@ -218,10 +204,6 @@ impl fmt::Display for GprSnapshot {
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  RegDiff                             ║
-// ╚══════════════════════════════════════╝
-
 /// A single register that changed between two snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegDiff {
@@ -243,9 +225,7 @@ impl fmt::Display for RegDiff {
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Seed values                         ║
-// ╚══════════════════════════════════════╝
+// --- Seed values ---
 
 /// Generate a deterministic seed value for register `xN`.
 ///
@@ -273,10 +253,6 @@ pub fn seeded_snapshot() -> GprSnapshot {
         amx: [0u64; AMX_STATE_COUNT],
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Tests                               ║
-// ╚══════════════════════════════════════╝
 
 #[cfg(test)]
 mod tests {

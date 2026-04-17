@@ -1,7 +1,3 @@
-// ╔══════════════════════════════════════╗
-// ║  sink — JSONL result serialization   ║
-// ╚══════════════════════════════════════╝
-//
 //! Writes probe results to a JSON Lines file for persistent, crash-safe logging.
 //!
 //! Each line is a self-contained JSON object ([`SinkRecord`]) with a schema
@@ -29,9 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::cpu_state::GPR_NAMES;
 use crate::probe::ObservedProbeResult;
 
-// ╔══════════════════════════════════════╗
-// ║  Schema types                        ║
-// ╚══════════════════════════════════════╝
+// --- Schema types ---
 
 /// Current schema version for the JSONL output format.
 const SCHEMA_VERSION: u32 = 1;
@@ -121,10 +115,6 @@ impl SinkRecord {
         }
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  ResultSink                          ║
-// ╚══════════════════════════════════════╝
 
 /// Default number of results between automatic flushes.
 const FLUSH_INTERVAL: usize = 1000;
@@ -248,10 +238,6 @@ impl Drop for ResultSink {
         let _ = self.flush();
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Tests                               ║
-// ╚══════════════════════════════════════╝
 
 #[cfg(test)]
 mod tests {

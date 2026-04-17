@@ -1,7 +1,3 @@
-// ╔══════════════════════════════════════╗
-// ║  signal_handler — SIGILL recovery    ║
-// ╚══════════════════════════════════════╝
-//
 //! Installs signal handlers for recovering from illegal instructions and
 //! hung probes:
 //!
@@ -25,9 +21,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-// ╔══════════════════════════════════════╗
-// ║  FFI: sigsetjmp / siglongjmp         ║
-// ╚══════════════════════════════════════╝
+// --- FFI: sigsetjmp / siglongjmp ---
 
 /// On macOS aarch64, `sigjmp_buf` = `int[49]` (196 bytes, align 4).
 /// The libc crate doesn't expose these on macOS, so we declare them manually.
@@ -69,9 +63,7 @@ unsafe extern "C" {
     pub safe fn siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Global state                        ║
-// ╚══════════════════════════════════════╝
+// --- Global state ---
 
 /// Set to `true` by the SIGILL handler when it fires.
 static SIGILL_FIRED: AtomicBool = AtomicBool::new(false);
@@ -109,9 +101,7 @@ static USE_LONGJMP: AtomicBool = AtomicBool::new(false);
 /// - Zero-initialised; `sigsetjmp` fills it before any longjmp can occur.
 pub static JMP_BUF: SigJmpBufWrapper = SigJmpBufWrapper::new();
 
-// ╔══════════════════════════════════════╗
-// ║  Handler installation                ║
-// ╚══════════════════════════════════════╝
+// --- Handler installation ---
 
 /// Install the `SIGILL`, `SIGALRM`, `SIGSEGV`, and `SIGBUS` handlers.
 ///
@@ -208,9 +198,7 @@ fn install_handler(
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Handler functions                   ║
-// ╚══════════════════════════════════════╝
+// --- Handler functions ---
 
 /// Helper: check if `__pc` is inside the JIT page bounds.
 fn is_inside_probe(ucontext: *mut libc::c_void) -> bool {
@@ -348,9 +336,7 @@ fn redirect_pc_to_escape(ucontext: *mut libc::c_void) {
     }
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Public interface                    ║
-// ╚══════════════════════════════════════╝
+// --- Public interface ---
 
 /// Set the escape address — the address of a `RET` instruction that the
 /// legacy signal handlers will jump to when recovering from a fault or timeout.
@@ -409,9 +395,7 @@ pub fn set_probe_bounds(start: u64, end: u64) {
     PROBE_END.store(end, Ordering::Relaxed);
 }
 
-// ╔══════════════════════════════════════╗
-// ║  SIGINT (Ctrl+C) support             ║
-// ╚══════════════════════════════════════╝
+// --- SIGINT (Ctrl+C) support ---
 
 /// Set to `true` by the SIGINT handler when Ctrl+C is pressed.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -456,9 +440,7 @@ pub fn clear_interrupted() {
     INTERRUPTED.store(false, Ordering::Relaxed);
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Timer helpers                       ║
-// ╚══════════════════════════════════════╝
+// --- Timer helpers ---
 
 /// Arm a one-shot real-time alarm after `micros` microseconds.
 ///
@@ -493,10 +475,6 @@ pub fn disarm_alarm() {
     let ret = unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
     debug_assert!(ret == 0, "setitimer (disarm) failed");
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Tests                               ║
-// ╚══════════════════════════════════════╝
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,3 @@
-// ╔══════════════════════════════════════╗
-// ║  emitter — JIT code generation       ║
-// ╚══════════════════════════════════════╝
-//
 //! Emits AArch64 instruction sequences into a [`JitPage`].
 //!
 //! The key sequences are the **prelude** and **postlude** that surround a
@@ -30,16 +26,12 @@
 use crate::cpu_state::{SnapshotBuffer, seed_value};
 use crate::jit_page::JitPage;
 
-// ╔══════════════════════════════════════╗
-// ║  AArch64 encoding helpers            ║
-// ╚══════════════════════════════════════╝
+// --- AArch64 encoding helpers ---
 
 /// AArch64 RET — return to caller via x30 (LR).
 const RET: u32 = 0xD65F_03C0;
 
-// ╔══════════════════════════════════════╗
-// ║  SME enable / disable                ║
-// ╚══════════════════════════════════════╝
+// --- SME enable / disable ---
 
 /// `SMSTART` — enable **both** streaming SVE mode (SM) and ZA tile storage.
 ///
@@ -168,9 +160,7 @@ const fn encode_mov_to_sp(rn: u8) -> u32 {
     0x9100_001F | ((rn as u32) << 5)
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Immediate loading                   ║
-// ╚══════════════════════════════════════╝
+// --- Immediate loading ---
 
 /// Emit instructions to load a full 64-bit immediate into register `rd`.
 ///
@@ -199,9 +189,7 @@ fn emit_load_imm64(page: &JitPage, offset: &mut usize, rd: u8, value: u64) -> us
     count
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Prelude / Postlude emission         ║
-// ╚══════════════════════════════════════╝
+// --- Prelude / Postlude emission ---
 
 /// The byte offset within [`SnapshotBuffer`] where the GPR array starts.
 const GPRS_OFFSET: usize = SnapshotBuffer::gprs_offset();
@@ -432,10 +420,6 @@ pub fn emit_postlude(
 /// Total: ~106 instructions × 4 bytes = ~424 bytes, well within 4096.
 #[allow(dead_code)]
 pub const ESTIMATED_OVERHEAD_BYTES: usize = 512; // conservative estimate
-
-// ╔══════════════════════════════════════╗
-// ║  Tests                               ║
-// ╚══════════════════════════════════════╝
 
 #[cfg(test)]
 mod tests {

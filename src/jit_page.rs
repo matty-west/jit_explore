@@ -1,7 +1,3 @@
-// ╔══════════════════════════════════════╗
-// ║  jit_page — W^X JIT memory on macOS ║
-// ╚══════════════════════════════════════╝
-//
 //! Safe wrapper around macOS `MAP_JIT` pages.
 //!
 //! This module handles the full lifecycle of a JIT-capable memory page:
@@ -12,9 +8,7 @@
 
 use std::fmt;
 
-// ╔══════════════════════════════════════╗
-// ║  FFI declarations                    ║
-// ╚══════════════════════════════════════╝
+// --- FFI declarations ---
 
 // NOTE: `pthread_jit_write_protect_np` and `sys_icache_invalidate` are not
 // exposed by the `libc` crate as of 0.2.x. We declare them manually.
@@ -29,9 +23,7 @@ unsafe extern "C" {
     fn sys_icache_invalidate(addr: *mut libc::c_void, len: libc::size_t);
 }
 
-// ╔══════════════════════════════════════╗
-// ║  Constants                           ║
-// ╚══════════════════════════════════════╝
+// --- Constants ---
 
 /// macOS `MAP_JIT` flag — allows toggling W^X permissions at runtime.
 /// Not defined in the `libc` crate for all targets, so we define it here.
@@ -39,9 +31,7 @@ unsafe extern "C" {
 /// Value from `<sys/mman.h>`: `#define MAP_JIT 0x0800`
 const MAP_JIT: libc::c_int = 0x0800;
 
-// ╔══════════════════════════════════════╗
-// ║  Error type                          ║
-// ╚══════════════════════════════════════╝
+// --- Error type ---
 
 /// Errors that can occur during JIT page operations.
 #[derive(Debug)]
@@ -65,10 +55,6 @@ impl std::error::Error for JitError {
         }
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  JitPage                             ║
-// ╚══════════════════════════════════════╝
 
 /// A page-aligned region of memory allocated with `MAP_JIT`.
 ///
@@ -294,10 +280,6 @@ impl fmt::Display for JitPage {
         write!(f, "JitPage @ {:p} ({} bytes)", self.ptr, self.size)
     }
 }
-
-// ╔══════════════════════════════════════╗
-// ║  Tests                               ║
-// ╚══════════════════════════════════════╝
 
 #[cfg(test)]
 mod tests {
