@@ -8,7 +8,7 @@ int main() {
     printf("amx_runner: Press ENTER to execute cblas_sgemm...\n");
     getchar(); // Blocks here. dyld is completely finished.
 
-    const int N = 8;
+    const int N = 64;
     float *A = (float *)malloc(N * N * sizeof(float));
     float *B = (float *)malloc(N * N * sizeof(float));
     float *C = (float *)malloc(N * N * sizeof(float));

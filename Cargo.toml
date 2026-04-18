@@ -3,7 +3,31 @@ name = "jit_explore"
 version = "0.1.0"
 edition = "2024"
 
+# ── Library crate (re-exports harness modules for benchmarks / integration tests)
+[lib]
+name = "jit_explore"
+path = "src/lib.rs"
+
+# ── Binary crate (gate runner)
+[[bin]]
+name = "jit_explore"
+path = "src/main.rs"
+
+# ── Runtime dependencies
 [dependencies]
-libc = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+libc        = "0.2"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+
+# ── Dev / bench dependencies
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ── Benchmark target
+[[bench]]
+name    = "crucible_bench"
+harness = false
+
+# ── macOS-only framework link
+[target.'cfg(target_os = "macos")'.dependencies]
+accelerate-src = "0.3.2"

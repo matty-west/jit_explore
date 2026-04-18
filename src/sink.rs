@@ -271,6 +271,7 @@ mod tests {
             diff: diffs,
             snapshot_corrupted: false,
             amx_changed: false,
+            gprs_post: None,
         }
     }
 
