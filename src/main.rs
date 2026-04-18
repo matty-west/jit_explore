@@ -5,6 +5,7 @@ mod cpu_state;
 mod crucible;
 mod emitter;
 mod jit_page;
+mod leaf;
 mod probe;
 mod signal_handler;
 mod sink;
@@ -1531,6 +1532,198 @@ fn gate_10() {
     println!("\n✓ gate 10 complete\n");
 }
 
+// --- Gate 13: Leaf Isolation — Self-Contained AMX Kernel Execution ---
+
+fn gate_13() {
+    use std::path::Path;
+    use crate::crucible::Crucible;
+    use crate::emitter::{AMX_SET, nop_pc_relative_hazards};
+    use crate::leaf::{all_leaves_from_file, best_leaf_from_file};
+
+    println!("── gate 13: leaf isolation — self-contained AMX kernel execution ──");
+    println!();
+
+    let blocks_json = Path::new("stolen_blocks.json");
+    if !blocks_json.exists() {
+        println!("  [!] stolen_blocks.json not found.");
+        println!("      Run `python3 heist/extract_all.py` first.");
+        return;
+    }
+
+    // ── 1. Survey all self-contained leaves in APL_sgemm ─────────────────────
+    println!("  [1/5] Surveying self-contained leaves in APL_sgemm...");
+    let all_leaves = all_leaves_from_file(blocks_json);
+    if all_leaves.is_empty() {
+        println!("  [!] No self-contained leaves found — block structure may have changed.");
+        return;
+    }
+
+    println!("  Found {} self-contained leaf candidate(s):", all_leaves.len());
+    for (i, leaf) in all_leaves.iter().take(10).enumerate() {
+        println!("    [{i}] {}", leaf.summary());
+    }
+    if all_leaves.len() > 10 {
+        println!("    ... ({} more)", all_leaves.len() - 10);
+    }
+    println!();
+
+    // ── 2. Select the best leaf ───────────────────────────────────────────────
+    println!("  [2/5] Selecting best leaf...");
+    let mut leaf = match best_leaf_from_file(blocks_json) {
+        Some(l) => l,
+        None => {
+            println!("  [!] best_leaf_from_file returned None — unexpected.");
+            return;
+        }
+    };
+    println!("  Selected: {}", leaf.summary());
+    println!("  Literal pool: {} words (code starts at index {})",
+        leaf.literal_pool_len, leaf.code_start());
+    if !leaf.adrp_indices.is_empty() || !leaf.adr_indices.is_empty() {
+        println!("  PC-relative hazards: ADRP@{:?}  ADR@{:?}",
+            leaf.adrp_indices, leaf.adr_indices);
+    }
+    println!();
+
+    // ── 3. Patch ADRP / ADR hazards ──────────────────────────────────────────
+    println!("  [3/5] Patching PC-relative hazards (ADRP/ADR → NOP)...");
+    let adrp_idx = leaf.adrp_indices.clone();
+    let adr_idx  = leaf.adr_indices.clone();
+    let n_patched = nop_pc_relative_hazards(&mut leaf.opcodes, &adrp_idx, &adr_idx);
+    println!("  Patched {n_patched} instruction(s).");
+    println!();
+
+    // ── 4. Build test block ───────────────────────────────────────────────────
+    // Layout: [AMX_SET] ++ leaf_opcodes
+    // The SMSTART in the prelude (streaming=true) enables the coprocessor;
+    // AMX_SET activates it for the AMX instruction space.
+    println!("  [4/5] Building AMX test block...");
+    let mut test_block: Vec<u32> = Vec::with_capacity(1 + leaf.opcodes.len());
+    test_block.push(AMX_SET);
+    test_block.extend_from_slice(&leaf.opcodes);
+    println!("  Test block: {} instructions  (1 AMX_SET + {} leaf)",
+        test_block.len(), leaf.opcodes.len());
+    println!();
+
+    // ── 5. Run differential Crucible test ────────────────────────────────────
+    //
+    // Matrix dimensions: 64×64 (matches the APL_sgemm ABI capture).
+    // ABI overrides from Frida heist capture:
+    //   x5  = B matrix pointer   (confirmed by ABI map)
+    //   x7  = A matrix pointer   (confirmed by ABI map)
+    //   x8  = C matrix pointer   (confirmed by ABI map)
+    //   x0  = 0x6f = 111         (outer N at APL_sgemm entry)
+    //   x1  = 0x6f = 111         (outer N)
+    //   x2  = 0x40 = 64          (K / block size)
+    //   x3  = 0x40 = 64
+    //   x4  = 0x40 = 64
+    //   x6  = 0x40 = 64
+    //   x10 = 2
+    println!("  [5/5] Running Crucible differential test (64×64, all-ones matrices)...");
+
+    let m = 64usize;
+    let n_dim = 64usize;
+    let k = 64usize;
+
+    let a = vec![1.0f32; m * k];
+    let b = vec![1.0f32; k * n_dim];
+    let mut c_jit = vec![0.0f32; m * n_dim];
+
+    // Pointer overrides (x5=B, x7=A, x8=C).
+    let mut overrides: Vec<(u8, u64)> = vec![
+        (5,  b.as_ptr()           as u64),
+        (7,  a.as_ptr()           as u64),
+        (8,  c_jit.as_mut_ptr()   as u64),
+    ];
+    // Dimension overrides from captured ABI (best-effort approximation).
+    overrides.extend_from_slice(&[
+        (0,  0x6f),                         // N = 111 (outer, matches capture)
+        (1,  0x6f),                         // N
+        (2,  k as u64),                     // K = 64
+        (3,  k as u64),
+        (4,  k as u64),
+        (6,  k as u64),
+        (9,  b.as_ptr() as u64),            // x9 = B_ptr (same as x5 in capture)
+        (10, 2),
+    ]);
+
+    let crucible    = Crucible::new();
+    let probe_result = crucible.probe.run_block_with_overrides(&test_block, &overrides, true);
+
+    println!();
+    if probe_result.faulted {
+        println!("  [✗] FAULT: {}", probe_result.status());
+        println!();
+        println!("  Diagnosis:");
+        if probe_result.segfaulted {
+            println!("    → SEGV: leaf accessed memory via wrong pointer (ABI mismatch?)");
+            println!("    → Try adjusting x0-x4 dimension overrides to match leaf expectations.");
+        } else if probe_result.timed_out {
+            println!("    → TIMEOUT: leaf hit an infinite loop (a backward branch with wrong counter).");
+            println!("    → Check x0 (loop count) override — current: 0x6f=111.");
+        } else {
+            println!("    → SIGILL: an AMX instruction requires different mode setup.");
+            println!("    → Try without AMX_SET prefix (set `test_block = leaf.opcodes` directly).");
+        }
+    } else {
+        println!("  ✓ Leaf executed without fault!");
+        println!();
+
+        // Accelerate baseline.
+        let c_accel = Crucible::run_accelerate(m, n_dim, k, &a, &b);
+
+        // Sample output.
+        let nonzero = c_jit.iter().filter(|&&v| v != 0.0).count();
+        let c_jit_first4: Vec<f32> = c_jit.iter().copied().take(4).collect();
+        let c_acc_first4: Vec<f32> = c_accel.iter().copied().take(4).collect();
+
+        println!("  c_jit     first 4: {:?}", c_jit_first4);
+        println!("  c_accel   first 4: {:?}", c_acc_first4);
+        println!("  c_jit non-zero elements: {}/{}", nonzero, c_jit.len());
+        println!();
+
+        if c_jit.iter().all(|&v| v == 0.0) {
+            println!("  [!] c_jit is all-zeros.");
+            println!("      Possible causes:");
+            println!("       a) The leaf computes into AMX Z-registers but this sub-function");
+            println!("          does not include the store-back (Z → C matrix).  The stores");
+            println!("          live in a different sub-function within APL_sgemm.");
+            println!("       b) ABI mismatch: x8 (C pointer) is not being written by this leaf.");
+            println!("       c) The size-dispatch prologue branched straight to RET.");
+            println!();
+            println!("  Next step: find a leaf that includes BOTH AMX FMA AND store-back ops.");
+            println!("             Run the leaf survey above and look for leaves with SME_ST > 0.");
+        } else {
+            let max_diff = Crucible::max_abs_diff(&c_accel, &c_jit);
+            println!("  Max |diff| vs Accelerate: {:.6}", max_diff);
+
+            if max_diff < 1e-4 {
+                println!();
+                println!("  ✓ ✓ ✓  GOLDEN BLOCK — SEMANTIC EQUIVALENCE PROVEN  ✓ ✓ ✓");
+                println!("  max_diff = {:.2e} < 1e-4 — leaf produces identical results to Accelerate!", max_diff);
+                println!();
+                println!("  Next step: run `cargo bench -- jit_hot` to get bare-metal throughput.");
+            } else {
+                println!();
+                println!("  [!] Not yet golden (target < 1e-4).");
+                // Diagnose the error character.
+                let ratio = if c_accel[0] != 0.0 { c_jit[0] / c_accel[0] } else { 0.0 };
+                println!("  c_jit[0] / c_accel[0] = {:.4}", ratio);
+                if (ratio - ratio.round()).abs() < 0.01 && ratio > 0.5 {
+                    println!("  → Near-integer ratio {:.0} — accumulator dirty state (use AMX Z-register clear).", ratio);
+                } else if ratio < 0.01 {
+                    println!("  → Near-zero ratio — store-back is partial or targeting wrong tile.");
+                } else {
+                    println!("  → Non-integer ratio — ABI mismatch (wrong A/B pointer strides?).");
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("✓ gate 13 complete\n");
+}
+
 fn main() {
     // gate_0();
     // gate_1();
@@ -1544,5 +1737,6 @@ fn main() {
     // gate_10();
     // gate_10_retry();
     // gate_11();
-    gate_12();
+    // gate_12();
+    gate_13();
 }

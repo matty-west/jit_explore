@@ -494,6 +494,154 @@ pub fn emit_postlude(
 #[allow(dead_code)]
 pub const ESTIMATED_OVERHEAD_BYTES: usize = 512; // conservative estimate
 
+// --- Apple AMX mode control ---
+
+/// `AMX_SET` — enable Apple's proprietary matrix coprocessor (AMX).
+///
+/// Encoding: `0x0020_1000` (corsix/amx community reverse-engineering).
+///
+/// Apple AMX is a **different** co-processor from ARM SME.  Its instructions
+/// live in the `0x0020_xxxx` opcode space and require this enable sequence
+/// before use.  On M-series chips the coprocessor is always physically present;
+/// `AMX_SET` tells the CPU to allow userspace access to it.
+///
+/// Must be paired with [`AMX_CLR`] to release the coprocessor.
+pub const AMX_SET: u32 = 0x0020_1000;
+
+/// `AMX_CLR` — disable Apple's proprietary matrix coprocessor (AMX).
+///
+/// Encoding: `0x0020_1001` (corsix/amx community reverse-engineering).
+pub const AMX_CLR: u32 = 0x0020_1001;
+
+// --- PC-relative hazard patching ---
+
+/// AArch64 NOP instruction.
+const NOP: u32 = 0xD503_201F;
+
+/// Replace `ADRP` and `ADR` instructions in an opcode slice with `NOP`.
+///
+/// `ADRP` and `ADR` compute addresses relative to the **current PC**.  When a
+/// heisted block is copied into a JIT page at a different address, these
+/// instructions will compute wrong values and typically corrupt a register or
+/// cause a fault.
+///
+/// ## Strategy
+///
+/// The simplest safe fix is to replace them with `NOP`.  This works when:
+/// - The ADRP/ADR is in a code path that is bypassed by a branch for the
+///   matrix sizes we test (common in Apple's size-dispatch prologue).
+/// - The destination register is overwritten before it is used.
+///
+/// If the NOP causes incorrect behaviour (register stays zero, causes fault),
+/// the caller should instead use full address injection via `gpr_overrides`
+/// in the prelude.
+///
+/// # Arguments
+/// - `opcodes`: mutable slice of instruction words.
+/// - `adrp_indices`: positions of `ADRP` instructions (from `LeafKernel`).
+/// - `adr_indices`: positions of `ADR` instructions (from `LeafKernel`).
+///
+/// Returns the number of instructions patched.
+pub fn nop_pc_relative_hazards(
+    opcodes:      &mut Vec<u32>,
+    adrp_indices: &[usize],
+    adr_indices:  &[usize],
+) -> usize {
+    let mut patched = 0usize;
+    for &idx in adrp_indices.iter().chain(adr_indices.iter()) {
+        if idx < opcodes.len() {
+            opcodes[idx] = NOP;
+            patched += 1;
+        }
+    }
+    patched
+}
+
+/// Rewrite all PC-relative branch offsets in `opcodes` for a block that has
+/// been relocated from `original_base_byte_offset` to `new_base_byte_offset`
+/// within the same JIT page (both are byte offsets from page start).
+///
+/// **For self-contained leaf kernels this function is a no-op** — all branch
+/// offsets are relative to other instructions within the same block, so their
+/// encoded deltas stay correct after a linear copy.  Only call this when you
+/// are placing a block at a non-contiguous offset from a sibling block that it
+/// references.
+///
+/// Handles: `B`, `BL`, `B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`.
+///
+/// Returns the number of instructions patched (0 for self-contained leafs).
+pub fn relocate_branches(
+    opcodes:                    &mut Vec<u32>,
+    original_base_byte_offset:  i64,
+    new_base_byte_offset:       i64,
+) -> usize {
+    let shift = original_base_byte_offset - new_base_byte_offset;
+    if shift == 0 {
+        return 0;
+    }
+
+    let mut patched = 0usize;
+
+    for (i, op) in opcodes.iter_mut().enumerate() {
+        let inst_pc_orig = original_base_byte_offset + (i as i64) * 4;
+        let inst_pc_new  = new_base_byte_offset       + (i as i64) * 4;
+
+        // B / BL — imm26 field [25:0], multiply by 4 for byte offset.
+        if (*op >> 26) == 0b000101 || (*op >> 26) == 0b100101 {
+            let raw26 = (*op & 0x3FF_FFFF) as i32;
+            let raw26 = if raw26 & 0x200_0000 != 0 { raw26 - 0x400_0000 } else { raw26 };
+            let target_abs = inst_pc_orig + raw26 as i64 * 4;
+            let new_delta  = (target_abs - inst_pc_new) / 4;
+            if new_delta >= -0x200_0000 && new_delta <= 0x1FF_FFFF {
+                let new_imm26 = (new_delta as u32) & 0x3FF_FFFF;
+                *op = (*op & 0xFC00_0000) | new_imm26;
+                patched += 1;
+            }
+            continue;
+        }
+        // B.cond — imm19 field [23:5].
+        if (*op >> 24) == 0x54 {
+            let raw19 = ((*op >> 5) & 0x7_FFFF) as i32;
+            let raw19 = if raw19 & 0x4_0000 != 0 { raw19 - 0x8_0000 } else { raw19 };
+            let target_abs = inst_pc_orig + raw19 as i64 * 4;
+            let new_delta  = (target_abs - inst_pc_new) / 4;
+            if new_delta >= -0x4_0000 && new_delta <= 0x3_FFFF {
+                let new_imm19 = (new_delta as u32) & 0x7_FFFF;
+                *op = (*op & 0xFF00_000F) | (new_imm19 << 5);
+                patched += 1;
+            }
+            continue;
+        }
+        // CBZ/CBNZ — imm19 field [23:5].
+        if (*op >> 24) & 0xFE == 0x34 {
+            let raw19 = ((*op >> 5) & 0x7_FFFF) as i32;
+            let raw19 = if raw19 & 0x4_0000 != 0 { raw19 - 0x8_0000 } else { raw19 };
+            let target_abs = inst_pc_orig + raw19 as i64 * 4;
+            let new_delta  = (target_abs - inst_pc_new) / 4;
+            if new_delta >= -0x4_0000 && new_delta <= 0x3_FFFF {
+                let new_imm19 = (new_delta as u32) & 0x7_FFFF;
+                *op = (*op & 0xFF00_001F) | (new_imm19 << 5);
+                patched += 1;
+            }
+            continue;
+        }
+        // TBZ/TBNZ — imm14 field [18:5].
+        if (*op >> 24) & 0xFE == 0x36 {
+            let raw14 = ((*op >> 5) & 0x3FFF) as i32;
+            let raw14 = if raw14 & 0x2000 != 0 { raw14 - 0x4000 } else { raw14 };
+            let target_abs = inst_pc_orig + raw14 as i64 * 4;
+            let new_delta  = (target_abs - inst_pc_new) / 4;
+            if new_delta >= -0x2000 && new_delta <= 0x1FFF {
+                let new_imm14 = (new_delta as u32) & 0x3FFF;
+                *op = (*op & 0xFFF8_001F) | (new_imm14 << 5);
+                patched += 1;
+            }
+        }
+    }
+
+    patched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
