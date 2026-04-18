@@ -3,70 +3,96 @@ import sys
 import json
 import time
 
-# Script to find the hot microkernel address by hooking EVERYTHING in vecLib
+# Static Module Sweep: Brute-force math libraries for AMX/SME patterns
 JS_CODE = """
 'use strict';
 
-function startTracing() {
-    const threadId = Process.getCurrentThreadId();
-    Stalker.follow(threadId, {
-        events: {
-            call: true,
-            ret: false
-        },
-        onReceive(events) {
-            const parsed = Stalker.parse(events, { annotate: true, stringify: false });
-            for (const event of parsed) {
-                if (event[0] === 'call') {
-                    const target = event[2];
-                    const targetPtr = ptr(target);
-                    try {
-                        const m = Process.getModuleByAddress(targetPtr);
-                        console.log('[>] CALL to ' + m.name + ' @ ' + targetPtr);
-                    } catch (e) {
-                        // console.log('[>] CALL to ' + targetPtr);
+const TARGET_MODULES = [
+    "libLinearAlgebra.dylib",
+    "libvDSP.dylib",
+    "libBNNS.dylib"
+];
+
+function staticSweep() {
+    console.log("[*] Commencing Static Sweep for AMX/SME Opcodes...");
+    let foundOpcodes = new Set();
+    let details = [];
+
+    TARGET_MODULES.forEach(modName => {
+        let mod = null;
+        try {
+            mod = Process.getModuleByName(modName);
+        } catch (e) {
+            console.log(`[!] Module ${modName} not found.`);
+            return;
+        }
+
+        console.log(`[*] Sweeping ${modName} @ ${mod.base}...`);
+        
+        let ranges = mod.enumerateRanges('r-x');
+        ranges.forEach(range => {
+            let address = range.base;
+            let end = range.base.add(range.size);
+
+            while (address.compare(end) < 0) {
+                let opcode = address.readU32();
+
+                // Mask for Legacy AMX (0x0020xxxx) or ARM SME (0x8080xxxx)
+                // Broadened masks to catch variants
+                if ((opcode & 0xFFF00000) === 0x00200000 || 
+                    (opcode & 0xFFF00000) === 0x80800000 ||
+                    (opcode & 0xFF000000) === 0x80000000) { // Catch more SME
+                    
+                    let hex = "0x" + (opcode >>> 0).toString(16).padStart(8, '0');
+                    if (!foundOpcodes.has(hex)) {
+                        foundOpcodes.add(hex);
+                        details.push({
+                            module: modName,
+                            address: address,
+                            opcode: hex
+                        });
                     }
                 }
+                address = address.add(4);
             }
-        }
+        });
     });
+
+    console.log(`[+] Sweep complete. Found ${foundOpcodes.size} unique candidate opcodes.`);
+    send({ type: 'opcodes', data: Array.from(foundOpcodes) });
 }
 
-let target = null;
-try {
-    target = Module.findExportByName(null, 'cblas_sgemm') || Module.findExportByName(null, '_cblas_sgemm');
-} catch (e) {}
-
-if (target) {
-    Interceptor.attach(target, {
-        onEnter(args) {
-            console.log('[*] cblas_sgemm entered. Starting call trace...');
-            startTracing();
-        },
-        onLeave(retval) {
-            Stalker.unfollow(Process.getCurrentThreadId());
-            console.log('[*] cblas_sgemm left.');
-        }
-    });
-}
+staticSweep();
 """
 
 def on_message(message, data):
-    print(message)
+    if message['type'] == 'send':
+        payload = message['payload']
+        if payload['type'] == 'opcodes':
+            print(f"[*] Total unique opcodes captured: {len(payload['data'])}")
+            if len(payload['data']) > 0:
+                with open('amx_opcodes.json', 'w') as f:
+                    json.dump(payload['data'], f, indent=2)
+                print("[*] Results saved to amx_opcodes.json")
+            else:
+                print("[!] No opcodes were captured.")
+            sys.exit(0)
+    else:
+        print(message)
 
-def main(pid):
+def main():
     try:
-        session = frida.attach(pid)
+        print("[*] Attaching to amx_runner for static sweep...")
+        session = frida.attach("amx_runner")
         script = session.create_script(JS_CODE)
         script.on('message', on_message)
         script.load()
-        print(f"[*] Attached to PID {pid}. Ready. PRESS ENTER in amx_runner...")
-        sys.stdin.read()
+        # The script executes immediately on load
+        # We just need to wait for it to finish and send the message
+        time.sleep(2)
+        session.detach()
     except Exception as e:
         print(f"[!] Error: {e}")
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python3 heist.py <pid>")
-        sys.exit(1)
-    main(int(sys.argv[1]))
+    main()

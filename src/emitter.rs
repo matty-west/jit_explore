@@ -197,6 +197,18 @@ const GPRS_OFFSET: usize = SnapshotBuffer::gprs_offset();
 /// The byte offset within [`SnapshotBuffer`] where the AMX state starts.
 const AMX_OFFSET: usize = SnapshotBuffer::amx_offset();
 
+/// `ZERO { ZA }` — zero all ZA tile storage.
+///
+/// Encoding: `1100 0000 0000 1000 0000 0000 1111 1111` = `0xC008_00FF`.
+///
+/// This instruction zeroes the entire ZA array unconditionally. Inserting it
+/// before executing a heisted outer-product loop guarantees a clean accumulator
+/// state, eliminating the "dirty-state" integer-multiple error observed when
+/// the ZA tiles contain residual values from a previous invocation.
+///
+/// Use this as the mandatory **first instruction** of every Golden Block.
+pub const ZERO_ZA: u32 = 0xC008_00FF;
+
 /// Encode `AMX_ST_TILE_T(n)` — store AMX tile `n` to `[Xn]`.
 ///
 /// Encoding: `0x0020_8000 | (tile_index << 0) | (rn << 5)`
@@ -205,6 +217,52 @@ const AMX_OFFSET: usize = SnapshotBuffer::amx_offset();
 /// be validated before use — see Gate 9 AMX validation probe.
 pub const fn encode_amx_store_tile(tile_index: u8, rn: u8) -> u32 {
     0x0020_8000 | (tile_index as u32) | ((rn as u32) << 5)
+}
+
+/// Encode `ST1W { ZA0H.S[Wv, #off], Pg, [Xn, Rm, LSL #2]` — SME horizontal
+/// word-width store of one slice of ZA0 to memory.
+///
+/// ## Bit-field layout (ARM SME ISA reference)
+///
+/// ```text
+/// [31:25] = 1110_000   (SME store space)
+/// [24]    = 0
+/// [23:22] = 01         (word / S element size)
+/// [21]    = 0          (horizontal slice)
+/// [20:16] = Rm         (offset register, LSL #2 applied)
+/// [15]    = 0
+/// [14]    = V          (tile index: 0 = ZA0)
+/// [13:11] = Pg         (governing predicate, P0–P7)
+/// [10]    = 0
+/// [9:5]   = Rn         (base register)
+/// [4:3]   = Wv         (slice index register: 0=W12, 1=W13, 2=W14, 3=W15)
+/// [2:1]   = off        (2-bit immediate slice offset, 0–3)
+/// [0]     = 0
+/// ```
+///
+/// ## Example
+/// `ST1W { ZA0H.S[W12, #0] }, P0, [X0, X1, LSL #2]`
+/// → `encode_sme_st1w_za_h(0, 0, 0, 0, 1)` = `0xE0A1_0000`
+///
+/// # Arguments
+/// - `wv`: slice-index register selector (0=W12, 1=W13, 2=W14, 3=W15)
+/// - `off2`: 2-bit slice immediate offset (0–3)
+/// - `pg`: governing predicate register index (0–7)
+/// - `rn`: base address register (Xn)
+/// - `rm`: offset register (Xm, scaled by element size)
+pub const fn encode_sme_st1w_za_h(wv: u8, off2: u8, pg: u8, rn: u8, rm: u8) -> u32 {
+    assert!(wv   <= 3,  "Wv selector must be 0–3 (W12–W15)");
+    assert!(off2 <= 3,  "off2 must be 0–3");
+    assert!(pg   <= 7,  "predicate register must be P0–P7");
+    assert!(rn   <= 30, "base register must be X0–X30");
+    assert!(rm   <= 30, "offset register must be X0–X30");
+    // tile V = 0 (ZA0)
+    0xE0A0_0000
+        | ((rm   as u32) << 16)
+        | ((pg   as u32) << 11)
+        | ((rn   as u32) <<  5)
+        | ((wv   as u32) <<  3)
+        | ((off2 as u32) <<  1)
 }
 
 /// Emit the **prelude** sequence into the JIT page.
@@ -230,7 +288,14 @@ pub const fn encode_amx_store_tile(tile_index: u8, rn: u8) -> u32 {
 ///   probed instruction runs in streaming SVE mode with ZA enabled. Use
 ///   `false` for all non-SME sweeps (standard ALU, HINT, etc.) to avoid
 ///   false-positive SIGILLs caused by the streaming-mode instruction subset.
-pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8, streaming: bool) -> usize {
+/// - `gpr_overrides`: Optional array of (register_index, value) to override
+///   default seeds. Useful for injecting pointers for semantic testing.
+pub fn emit_prelude(
+    page: &JitPage,
+    buf_pre_ptr: *mut u8,
+    streaming: bool,
+    gpr_overrides: &[(u8, u64)],
+) -> usize {
     let mut off = 0usize;
     
     // Step 1: Push X28, X30 to stack (pre-indexed: SP -= 16, then store).
@@ -283,7 +348,12 @@ pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8, streaming: bool) -> us
     // Step 8: Load seed values into X0–X27.
     // X28 keeps the buf_pre pointer — we DON'T seed it.
     for reg in 0..28u8 {
-        emit_load_imm64(page, &mut off, reg, seed_value(reg));
+        let value = gpr_overrides
+            .iter()
+            .find(|(r, _)| *r == reg)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| seed_value(reg));
+        emit_load_imm64(page, &mut off, reg, value);
     }
 
     // ── Step 9: Conditionally enable AMX/SME ──
@@ -292,6 +362,9 @@ pub fn emit_prelude(page: &JitPage, buf_pre_ptr: *mut u8, streaming: bool) -> us
     // false-positive SIGILLs because most standard instructions are illegal in
     // streaming SVE mode.
     if streaming {
+        // SMSTART enables both Streaming Mode (SM) and the ZA array.
+        // On M4, some instructions in the 0x0020xxxx range might explicitly
+        // require ZA to be enabled.
         page.write_instruction(off, SMSTART);
         off += 4;
     }
@@ -471,7 +544,7 @@ mod tests {
         let page = JitPage::alloc(4096).expect("alloc");
         let mut buf = crate::cpu_state::SnapshotBuffer::new();
         page.make_writable();
-        let end = emit_prelude(&page, buf.as_mut_ptr(), false);
+        let end = emit_prelude(&page, buf.as_mut_ptr(), false, &[]);
         assert!(
             end < 4096 - 256,
             "prelude (non-streaming) used {end} bytes, not enough room for postlude"
@@ -484,7 +557,7 @@ mod tests {
         let mut buf = crate::cpu_state::SnapshotBuffer::new();
         page.make_writable();
         // Streaming adds 1 extra instruction (SMSTART).
-        let end = emit_prelude(&page, buf.as_mut_ptr(), true);
+        let end = emit_prelude(&page, buf.as_mut_ptr(), true, &[]);
         assert!(
             end < 4096 - 256,
             "prelude (streaming) used {end} bytes, not enough room for postlude"

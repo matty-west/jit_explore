@@ -160,7 +160,12 @@ impl GprSnapshot {
             .iter()
             .zip(other.gprs.iter())
             .enumerate()
-            .filter(|(_, (a, b))| a != b)
+            .filter(|(i, (a, b))| {
+                // Filter out noisy platform registers:
+                // x16, x17: IP0/IP1 (linker veneers)
+                // x18: Darwin platform register (TEB pointer)
+                *i != 16 && *i != 17 && *i != 18 && a != b
+            })
             .map(|(i, (&pre, &post))| RegDiff {
                 index: i,
                 pre,
