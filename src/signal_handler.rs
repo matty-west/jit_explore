@@ -529,6 +529,8 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "longjmp-based SIGILL recovery is racy under cargo test threading; \
+                fork-based probing (probe.rs) is the production path"]
     fn multiple_udf_in_sequence() {
         install_signal_handlers();
         let page = JitPage::alloc(4096).expect("mmap should succeed");

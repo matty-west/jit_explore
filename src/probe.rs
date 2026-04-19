@@ -6,9 +6,7 @@ use std::time::Instant;
 use crate::cpu_state::{GprSnapshot, RegDiff, SnapshotBuffer, seeded_snapshot};
 use crate::emitter;
 use crate::jit_page::JitPage;
-use crate::crucible::{CblasOrder, CblasTranspose};
 
-#[cfg(target_os = "macos")]
 #[cfg(target_os = "macos")]
 mod accelerate {
     use crate::crucible::{CblasOrder, CblasTranspose};
@@ -20,39 +18,31 @@ mod accelerate {
             order: CblasOrder,
             trans_a: CblasTranspose,
             trans_b: CblasTranspose,
-            m: c_int,
-            n: c_int,
-            k: c_int,
+            m: c_int, n: c_int, k: c_int,
             alpha: c_float,
-            a: *const c_float,
-            lda: c_int,
-            b: *const c_float,
-            ldb: c_int,
+            a: *const c_float, lda: c_int,
+            b: *const c_float, ldb: c_int,
             beta: c_float,
-            c: *mut c_float,
-            ldc: c_int,
+            c: *mut c_float, ldc: c_int,
         );
     }
 
-    pub fn wake_amx() {
+    /// Wake the SME/matrix hardware via a cheap Accelerate call.
+    pub fn wake_hardware() {
         let a = [1.0f32];
         let b = [1.0f32];
         let mut c = [0.0f32];
         unsafe {
             cblas_sgemm(
-                CblasOrder::RowMajor,
-                CblasTranspose::NoTrans,
-                CblasTranspose::NoTrans,
-                1, 1, 1, 1.0, a.as_ptr(), 1, b.as_ptr(), 1, 0.0, c.as_mut_ptr(), 1
+                CblasOrder::RowMajor, CblasTranspose::NoTrans, CblasTranspose::NoTrans,
+                1, 1, 1, 1.0, a.as_ptr(), 1, b.as_ptr(), 1, 0.0, c.as_mut_ptr(), 1,
             );
             let a2 = [1.0f32; 16];
             let b2 = [1.0f32; 16];
             let mut c2 = [0.0f32; 16];
             cblas_sgemm(
-                CblasOrder::RowMajor,
-                CblasTranspose::NoTrans,
-                CblasTranspose::NoTrans,
-                4, 4, 4, 1.0, a2.as_ptr(), 4, b2.as_ptr(), 4, 0.0, c2.as_mut_ptr(), 4
+                CblasOrder::RowMajor, CblasTranspose::NoTrans, CblasTranspose::NoTrans,
+                4, 4, 4, 1.0, a2.as_ptr(), 4, b2.as_ptr(), 4, 0.0, c2.as_mut_ptr(), 4,
             );
         }
     }
@@ -67,12 +57,10 @@ impl<T> SharedMemory<T> {
         let size = std::mem::size_of::<T>();
         let ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),
-                size,
+                std::ptr::null_mut(), size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANON | libc::MAP_SHARED,
-                -1,
-                0,
+                -1, 0,
             )
         };
         assert!(ptr != libc::MAP_FAILED, "Failed to mmap shared memory");
@@ -111,16 +99,11 @@ impl ProbeResult {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct BatchProbeResult {
-    pub opcodes: Vec<u32>,
-    pub results: Vec<ProbeResult>,
-}
-
 impl fmt::Display for ProbeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let le = self.opcode.to_le_bytes();
-        write!(f, "0x{:08X}  [{:02x} {:02x} {:02x} {:02x}]  {}", self.opcode, le[0], le[1], le[2], le[3], self.status())
+        write!(f, "0x{:08X}  [{:02x} {:02x} {:02x} {:02x}]  {}",
+            self.opcode, le[0], le[1], le[2], le[3], self.status())
     }
 }
 
@@ -138,7 +121,8 @@ pub struct SweepSummary {
 impl fmt::Display for SweepSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rate = if self.elapsed.as_secs_f64() > 0.0 { self.total as f64 / self.elapsed.as_secs_f64() } else { 0.0 };
-        write!(f, "{} probed: {} ok, {} SIGILL, {} SEGV, {} TRAP, {} TIMEOUT ({:.0} ops/sec, {:.3?})", self.total, self.ok, self.faulted, self.segfaulted, self.trapped, self.timed_out, rate, self.elapsed)
+        write!(f, "{} probed: {} ok, {} SIGILL, {} SEGV, {} TRAP, {} TIMEOUT ({:.0} ops/sec, {:.3?})",
+            self.total, self.ok, self.faulted, self.segfaulted, self.trapped, self.timed_out, rate, self.elapsed)
     }
 }
 
@@ -149,7 +133,6 @@ pub struct ObservedProbeResult {
     pub post: Option<GprSnapshot>,
     pub diff: Vec<RegDiff>,
     pub snapshot_corrupted: bool,
-    pub amx_changed: bool,
     pub gprs_post: Option<GprSnapshot>,
 }
 
@@ -158,8 +141,6 @@ pub enum ProbeClassification {
     Undefined,
     NopLike,
     GprMutating,
-    AmxMutating,
-    GprAndAmxMutating,
     MemoryFault,
     Trapped,
     Hung,
@@ -171,15 +152,8 @@ impl ObservedProbeResult {
         else if self.base.faulted { ProbeClassification::Undefined }
         else if self.base.segfaulted { ProbeClassification::MemoryFault }
         else if self.base.trapped { ProbeClassification::Trapped }
-        else {
-            let gpr_changed = !self.diff.is_empty();
-            match (gpr_changed, self.amx_changed) {
-                (false, false) => ProbeClassification::NopLike,
-                (true, false)  => ProbeClassification::GprMutating,
-                (false, true)  => ProbeClassification::AmxMutating,
-                (true, true)   => ProbeClassification::GprAndAmxMutating,
-            }
-        }
+        else if !self.diff.is_empty() { ProbeClassification::GprMutating }
+        else { ProbeClassification::NopLike }
     }
 }
 
@@ -204,26 +178,12 @@ const DEFAULT_TIMEOUT_MICROS: u64 = 5_000;
 
 impl Probe {
     pub fn new() -> Self {
-        // Allocate 1MB to accommodate large heisted BLAS functions (can exceed 200KB).
         let page = JitPage::alloc(1024 * 1024).expect("failed to alloc JIT page for probe");
         Probe { page, timeout_micros: DEFAULT_TIMEOUT_MICROS }
     }
 
     pub fn page_ptr(&self) -> *const u8 { self.page.as_ptr() }
     pub fn page_size(&self) -> usize { self.page.size() }
-
-    pub fn sweep(&self, opcodes: impl Iterator<Item = u32>) -> (Vec<ProbeResult>, SweepSummary) {
-        let start = Instant::now();
-        let results: Vec<ProbeResult> = opcodes.map(|op| self.run(op)).collect();
-        let elapsed = start.elapsed();
-        let ok = results.iter().filter(|r| !r.faulted && !r.timed_out && !r.segfaulted && !r.trapped).count();
-        let faulted = results.iter().filter(|r| r.faulted).count();
-        let timed_out = results.iter().filter(|r| r.timed_out).count();
-        let segfaulted = results.iter().filter(|r| r.segfaulted).count();
-        let trapped = results.iter().filter(|r| r.trapped).count();
-        let summary = SweepSummary { total: results.len(), ok, faulted, timed_out, segfaulted, trapped, elapsed };
-        (results, summary)
-    }
 
     pub fn run_block(&self, opcodes: &[u32]) -> ProbeResult {
         self.run_block_with_overrides(opcodes, &[], false)
@@ -267,7 +227,7 @@ impl Probe {
                 if wake {
                     use std::sync::atomic::{AtomicBool, Ordering};
                     static WOKEN: AtomicBool = AtomicBool::new(false);
-                    if !WOKEN.swap(true, Ordering::SeqCst) { accelerate::wake_amx(); }
+                    if !WOKEN.swap(true, Ordering::SeqCst) { accelerate::wake_hardware(); }
                 }
                 self.page.call_void();
                 libc::_exit(0);
@@ -318,7 +278,7 @@ impl Probe {
                 libc::signal(libc::SIGALRM, libc::SIG_DFL);
                 self.page.make_executable();
                 #[cfg(target_os = "macos")]
-                accelerate::wake_amx();
+                accelerate::wake_hardware();
                 self.page.call_void();
                 libc::_exit(0);
             } else if pid > 0 {
@@ -388,7 +348,7 @@ impl Probe {
                 libc::signal(libc::SIGALRM, libc::SIG_DFL);
                 self.page.make_executable();
                 #[cfg(target_os = "macos")]
-                accelerate::wake_amx();
+                accelerate::wake_hardware();
                 self.page.call_void();
                 libc::_exit(0);
             } else if pid > 0 {
@@ -424,7 +384,7 @@ impl Probe {
             Some(post_snap) => seeded_snapshot().diff(post_snap).into_iter().filter(|d| d.index < 28).collect(),
             _ => Vec::new(),
         };
-        ObservedProbeResult { base, pre: Some(seeded_snapshot()), post: post.clone(), diff, snapshot_corrupted: !buf_pre.get().canaries_intact() || !buf_post.get().canaries_intact(), amx_changed: false, gprs_post: post }
+        ObservedProbeResult { base, pre: Some(seeded_snapshot()), post: post.clone(), diff, snapshot_corrupted: !buf_pre.get().canaries_intact() || !buf_post.get().canaries_intact(), gprs_post: post }
     }
 
     pub fn run_observed_streaming(&self, opcode: u32) -> ObservedProbeResult {
@@ -460,7 +420,7 @@ impl Probe {
                 {
                     use std::sync::atomic::{AtomicBool, Ordering};
                     static WOKEN: AtomicBool = AtomicBool::new(false);
-                    if !WOKEN.swap(true, Ordering::SeqCst) { accelerate::wake_amx(); }
+                    if !WOKEN.swap(true, Ordering::SeqCst) { accelerate::wake_hardware(); }
                 }
                 self.page.call_void();
                 libc::_exit(0);
@@ -497,7 +457,7 @@ impl Probe {
             Some(post_snap) => seeded_snapshot().diff(post_snap).into_iter().filter(|d| d.index < 28).collect(),
             _ => Vec::new(),
         };
-        ObservedProbeResult { base, pre: Some(seeded_snapshot()), post: post.clone(), diff, snapshot_corrupted: !buf_pre.get().canaries_intact() || !buf_post.get().canaries_intact(), amx_changed: match (&post, faulted || timed_out) { (Some(p), false) => seeded_snapshot().amx_changed(p), _ => false }, gprs_post: post }
+        ObservedProbeResult { base, pre: Some(seeded_snapshot()), post: post.clone(), diff, snapshot_corrupted: !buf_pre.get().canaries_intact() || !buf_post.get().canaries_intact(), gprs_post: post }
     }
 
     pub fn observed_sweep_streaming(&self, opcodes: impl Iterator<Item = u32>, sink: &mut crate::sink::ResultSink, progress_interval: usize) -> (SweepSummary, bool) {
