@@ -1,4 +1,4 @@
-# OPCODE — Bare-Metal Apple M4 SME Exploration
+# jit_explore — Bare-Metal Apple M4 SME Exploration
 
 A Rust JIT harness for reverse-engineering and executing matrix coprocessor instructions on Apple Silicon that **beats Accelerate.framework by 2.5×** at small tile sizes.
 
