@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>A <a href="https://github.com/dawnstate">Dawn State</a> research project</strong> · Silicon Exploitation & Bare-Metal Optimization
+  <strong>A <a href="https://github.com/dawn-state">Dawn State</a> research project</strong> · Silicon Exploitation & Bare-Metal Optimization
 </p>
 
 ---
