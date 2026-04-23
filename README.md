@@ -60,8 +60,8 @@ These parameters were discovered through empirical instruction probing — not f
 | 14c | **SME pivot: FMOPA produces first non-zero result** | ✅ |
 | 14d | **Full 16×16×K SGEMM, max_diff = 0.0 vs Accelerate** | ✅ |
 | 15 | **Benchmark: JIT beats Accelerate 1.8–2.5×** | ✅ |
-| 16 | BFMOPA/SMOPA probing — discover BF16/INT8 outer product support | ⬜ |
-| 17 | Fused GEMM+Activation kernels (matmul+ReLU/GELU in one kernel) | ⬜ |
+| 16 | BFMOPA/SMOPA probing — discover BF16/INT8 outer product support | ✅ |
+| 17 | Fused GEMM+Activation kernels (matmul+ReLU/GELU in one kernel) | ✅ |
 | 18 | Tiny inference engine demo (MLP via chained fused kernels) | ⬜ |
 
 See [ROADMAP.md](ROADMAP.md) for detailed next-step plans.
