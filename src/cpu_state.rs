@@ -46,6 +46,8 @@ pub struct SnapshotBuffer {
     pub canary_head: u64,
     /// The 31 GPRs: x0–x30.
     pub gprs: [u64; GPR_COUNT],
+    /// Virtual counter timestamp (CNTVCT_EL0).
+    pub timestamp: u64,
     /// Tail canary — detect corruption from wild stores.
     pub canary_tail: u64,
 }
@@ -56,6 +58,7 @@ impl SnapshotBuffer {
         SnapshotBuffer {
             canary_head: CANARY_HEAD,
             gprs: [0u64; GPR_COUNT],
+            timestamp: 0,
             canary_tail: CANARY_TAIL,
         }
     }
@@ -83,6 +86,11 @@ impl SnapshotBuffer {
     /// The prelude/postlude use this to know where to write registers.
     pub const fn gprs_offset() -> usize {
         std::mem::offset_of!(SnapshotBuffer, gprs)
+    }
+
+    /// Returns the byte offset of `timestamp` from the start of the struct.
+    pub const fn timestamp_offset() -> usize {
+        std::mem::offset_of!(SnapshotBuffer, timestamp)
     }
 
     /// Returns a mutable pointer to the start of this buffer.

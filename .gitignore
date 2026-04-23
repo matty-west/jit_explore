@@ -15,6 +15,7 @@ __pycache__/
 heist/amx_runner
 
 # Debug / scratch logs
+latency_table.jsonl
 heist_debug.txt
 heist_output.txt
 *.log

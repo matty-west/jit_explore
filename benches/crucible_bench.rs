@@ -19,7 +19,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use sme_jit_core::emitter::{build_sme_sgemm_16x16, build_sme_sgemm_page};
+use sme_jit_core::emitter::{build_sme_sgemm_16x16, build_sme_sgemm_page, Activation};
 use sme_jit_core::probe::{Probe, SharedMemory};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ fn bench_jit_cold(c: &mut Criterion) {
         let n = 16;
         let a = vec![1.0f32; m * k];
         let b = vec![1.0f32; k * n];
-        let block = build_sme_sgemm_16x16(k);
+        let block = build_sme_sgemm_16x16(k, Activation::None);
 
         group.bench_with_input(BenchmarkId::new("16x16", k), &k, |b_iter, &_k| {
             let c_shared = SharedMemory::<[f32; 256]>::new();
@@ -154,9 +154,11 @@ fn bench_jit_hot(c: &mut Criterion) {
 
         let page = match build_sme_sgemm_page(
             k,
+            Activation::None,
             a.as_ptr() as u64,
             b.as_ptr() as u64,
             c_out.as_mut_ptr() as u64,
+            0,
         ) {
             Some(p) => p,
             None => {
@@ -191,6 +193,53 @@ fn bench_jit_hot(c: &mut Criterion) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Group 4: Fused JIT (GEMM + ReLU, GEMM + Bias + ReLU)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn bench_fused(c: &mut Criterion) {
+    wake_hardware();
+
+    let mut group = c.benchmark_group("fused");
+    group.sample_size(500);
+
+    let k = 16;
+    let m = 16;
+    let n = 16;
+    let a = vec![1.0f32; m * k];
+    let b = vec![1.0f32; k * n];
+    let bias = vec![0.5f32; n];
+    let mut c_out = vec![0.0f32; m * n];
+
+    // Benchmark GEMM + ReLU
+    let page_relu = build_sme_sgemm_page(
+        k, Activation::ReLU,
+        a.as_ptr() as u64, b.as_ptr() as u64, c_out.as_mut_ptr() as u64, 0
+    ).unwrap();
+
+    group.bench_function("sgemm_relu_16x16", |b_iter| {
+        b_iter.iter(|| {
+            unsafe { page_relu.call_void(); }
+            black_box(&c_out);
+        });
+    });
+
+    // Benchmark GEMM + Bias + ReLU
+    let page_bias_relu = build_sme_sgemm_page(
+        k, Activation::BiasReLU,
+        a.as_ptr() as u64, b.as_ptr() as u64, c_out.as_mut_ptr() as u64, bias.as_ptr() as u64
+    ).unwrap();
+
+    group.bench_function("sgemm_bias_relu_16x16", |b_iter| {
+        b_iter.iter(|| {
+            unsafe { page_bias_relu.call_void(); }
+            black_box(&c_out);
+        });
+    });
+
+    group.finish();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Criterion entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -199,5 +248,6 @@ criterion_group!(
     bench_accelerate,
     bench_jit_cold,
     bench_jit_hot,
+    bench_fused,
 );
 criterion_main!(benches);

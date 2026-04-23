@@ -32,6 +32,8 @@ pub struct SinkRecord {
     pub status: String,
     pub diff: Vec<DiffEntry>,
     pub corrupted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency: Option<f64>,
 }
 
 impl SinkRecord {
@@ -45,12 +47,19 @@ impl SinkRecord {
             })
             .collect();
 
+        let latency = if result.base.timestamp_post > result.base.timestamp_pre {
+            Some(result.base.timestamp_post.wrapping_sub(result.base.timestamp_pre) as f64)
+        } else {
+            None
+        };
+
         SinkRecord {
             v: SCHEMA_VERSION,
             opcode: format!("0x{:08X}", result.base.opcode),
             status: result.base.status().to_string(),
             diff,
             corrupted: result.snapshot_corrupted,
+            latency,
         }
     }
 }

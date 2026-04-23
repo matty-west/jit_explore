@@ -87,6 +87,8 @@ pub struct ProbeResult {
     pub segfaulted: bool,
     pub trapped: bool,
     pub fault_offset: u32,
+    pub timestamp_pre: u64,
+    pub timestamp_post: u64,
 }
 
 impl ProbeResult {
@@ -194,6 +196,10 @@ impl Probe {
     }
 
     pub fn run_block_with_overrides_ext(&self, opcodes: &[u32], gpr_overrides: &[(u8, u64)], streaming: bool, wake: bool) -> ProbeResult {
+        self.run_block_with_overrides_ext_timed(opcodes, gpr_overrides, streaming, wake, false)
+    }
+
+    pub fn run_block_with_overrides_ext_timed(&self, opcodes: &[u32], gpr_overrides: &[(u8, u64)], streaming: bool, wake: bool, timed: bool) -> ProbeResult {
         let buf_pre = SharedMemory::<SnapshotBuffer>::new();
         let buf_post = SharedMemory::<SnapshotBuffer>::new();
         unsafe {
@@ -201,12 +207,12 @@ impl Probe {
             *buf_post.as_mut_ptr() = SnapshotBuffer::new();
         }
         self.page.make_writable();
-        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, streaming, gpr_overrides);
+        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, streaming, gpr_overrides, timed);
         for &op in opcodes {
             self.page.write_instruction(off, op);
             off += 4;
         }
-        emitter::emit_postlude(&self.page, off, buf_post.as_mut_ptr() as *mut u8, buf_pre.as_mut_ptr() as *mut u8, streaming);
+        emitter::emit_postlude(&self.page, off, buf_post.as_mut_ptr() as *mut u8, buf_pre.as_mut_ptr() as *mut u8, streaming, timed);
         self.page.make_executable();
 
         let mut faulted = false;
@@ -256,7 +262,13 @@ impl Probe {
                 }
             } else { panic!("fork failed"); }
         }
-        ProbeResult { opcode: opcodes[0], faulted, timed_out, segfaulted, trapped, fault_offset: 0 }
+        let (ts_pre, ts_post) = unsafe {
+            ( (*buf_pre.as_mut_ptr()).timestamp, (*buf_post.as_mut_ptr()).timestamp )
+        };
+        ProbeResult { 
+            opcode: opcodes[0], faulted, timed_out, segfaulted, trapped, fault_offset: 0,
+            timestamp_pre: ts_pre, timestamp_post: ts_post,
+        }
     }
 
     pub fn run(&self, opcode: u32) -> ProbeResult {
@@ -309,7 +321,7 @@ impl Probe {
                 }
             } else { panic!("fork failed"); }
         }
-        ProbeResult { opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0 }
+        ProbeResult { opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0, timestamp_pre: 0, timestamp_post: 0 }
     }
 
     pub fn run_observed(&self, opcode: u32) -> ObservedProbeResult {
@@ -328,11 +340,11 @@ impl Probe {
             *buf_post.as_mut_ptr() = SnapshotBuffer::new();
         }
         self.page.make_writable();
-        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, false, gpr_overrides);
+        let mut off = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, false, gpr_overrides, false);
         for &inst in prefix { self.page.write_instruction(off, inst); off += 4; }
         self.page.write_instruction(off, opcode); off += 4;
         for &inst in suffix { self.page.write_instruction(off, inst); off += 4; }
-        emitter::emit_postlude(&self.page, off, buf_post.as_mut_ptr() as *mut u8, buf_pre.as_mut_ptr() as *mut u8, false);
+        emitter::emit_postlude(&self.page, off, buf_post.as_mut_ptr() as *mut u8, buf_pre.as_mut_ptr() as *mut u8, false, false);
         self.page.make_executable();
         let mut faulted = false;
         let mut timed_out = false;
@@ -378,7 +390,13 @@ impl Probe {
                 }
             } else { panic!("fork failed"); }
         }
-        let base = ProbeResult { opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0 };
+        let (ts_pre, ts_post) = unsafe {
+            ( (*buf_pre.as_mut_ptr()).timestamp, (*buf_post.as_mut_ptr()).timestamp )
+        };
+        let base = ProbeResult { 
+            opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0,
+            timestamp_pre: ts_pre, timestamp_post: ts_post,
+        };
         let post = if faulted || timed_out || segfaulted || trapped { None } else { buf_post.get().to_snapshot() };
         let diff = match &post {
             Some(post_snap) => seeded_snapshot().diff(post_snap).into_iter().filter(|d| d.index < 28).collect(),
@@ -399,9 +417,9 @@ impl Probe {
             *buf_post.as_mut_ptr() = SnapshotBuffer::new();
         }
         self.page.make_writable();
-        let opcode_offset = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, true, gpr_overrides);
+        let opcode_offset = emitter::emit_prelude(&self.page, buf_pre.as_mut_ptr() as *mut u8, true, gpr_overrides, false);
         self.page.write_instruction(opcode_offset, opcode);
-        emitter::emit_postlude(&self.page, opcode_offset + 4, buf_post.as_mut_ptr() as *mut u8, buf_pre.as_mut_ptr() as *mut u8, true);
+        emitter::emit_postlude(&self.page, opcode_offset + 4, buf_post.as_mut_ptr() as *mut u8, buf_pre.as_mut_ptr() as *mut u8, true, false);
         self.page.make_executable();
         let mut faulted = false;
         let mut timed_out = false;
@@ -451,7 +469,13 @@ impl Probe {
                 }
             } else { panic!("fork failed"); }
         }
-        let base = ProbeResult { opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0 };
+        let (ts_pre, ts_post) = unsafe {
+            ( (*buf_pre.as_mut_ptr()).timestamp, (*buf_post.as_mut_ptr()).timestamp )
+        };
+        let base = ProbeResult { 
+            opcode, faulted, timed_out, segfaulted, trapped, fault_offset: 0,
+            timestamp_pre: ts_pre, timestamp_post: ts_post,
+        };
         let post = if faulted || timed_out || segfaulted || trapped { None } else { buf_post.get().to_snapshot() };
         let diff = match &post {
             Some(post_snap) => seeded_snapshot().diff(post_snap).into_iter().filter(|d| d.index < 28).collect(),
@@ -514,6 +538,33 @@ impl Probe {
         if total > 0 { eprintln!(); }
         let _ = sink.flush();
         (SweepSummary { total, ok, faulted, timed_out, segfaulted, trapped, elapsed: start.elapsed() }, interrupted)
+    }
+
+    /// Measure the average hardware timer ticks per execution of a block.
+    pub fn run_latency_benchmark(&self, opcodes: &[u32], iterations: usize, streaming: bool) -> Option<f64> {
+        let mut block = Vec::with_capacity(opcodes.len() + 10);
+        
+        // 1. Initialize iteration counter X9
+        // MOV X9, iterations
+        let imm = iterations as u16;
+        block.push(0xD280_0000 | ((imm as u32) << 5) | 9); 
+
+        // 2. Loop start
+        let loop_start_idx = block.len();
+        for &op in opcodes { block.push(op); }
+
+        // 3. Decrement and branch
+        // SUBS X9, X9, #1
+        block.push(emitter::encode_subs_x_imm(9, 9, 1));
+        // B.NE loop_start
+        let offset_bytes = -((block.len() - loop_start_idx) as i32 * 4);
+        block.push(emitter::encode_b_ne(offset_bytes));
+
+        let result = self.run_block_with_overrides_ext_timed(&block, &[], streaming, true, true);
+        if result.faulted || result.timed_out { return None; }
+
+        let diff = result.timestamp_post.wrapping_sub(result.timestamp_pre);
+        Some(diff as f64 / iterations as f64)
     }
 }
 
