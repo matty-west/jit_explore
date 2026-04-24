@@ -1,9 +1,13 @@
 [package]
 name = "sme-jit-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Zero-overhead Rust JIT harness for ARM SME on Apple Silicon M4"
-repository = "https://github.com/dawnstate/sme-jit-core"
+description = "Zero-overhead Rust JIT harness for ARM SME on Apple Silicon M4 — beats Accelerate.framework at tile-sized matmuls and tiny-model inference"
+repository = "https://github.com/dawn-state/sme-jit-core"
+license = "MIT OR Apache-2.0"
+keywords = ["arm", "sme", "jit", "matrix", "apple-silicon"]
+categories = ["hardware-support", "science"]
+readme = "README.md"
 
 # ── Library crate (re-exports harness modules for benchmarks / integration tests)
 [lib]

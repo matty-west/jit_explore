@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–23 are complete. We have:
+Gates 0–24 are complete. We have:
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
 - Proof that M4 uses ARM SME (not AMX)
 - A 16×16 SGEMM kernel (PTRUE → ZERO ZA → [LD1W×2 + FMOPA + ADD×2]×K → [ST1W + ADD×2]×16)
@@ -339,16 +339,67 @@ Hidden dim 48 was chosen as the sweet spot — the largest dimension where tiled
 - ~0.4 μs saved from eliminating 2 Rust transposes (16×48 = 768 scalar copies each)
 - Zero Rust function call overhead between layers (no BLR/RET, no Rust stack frames)
 
-## Gate 24: Publish & Document
+## Gate 24: Clean Public API & Benchmarks (Complete)
 
-**Goal**: Package the project for public consumption — blog post, clean API, reproducible benchmarks.
+**Goal**: Package the project for public consumption — clean API, proper error types, reproducible Criterion benchmarks, crate metadata.
+
+**Status**: Complete.
+
+**Deliverables**:
+
+1. **`api.rs` — Public API surface**:
+   - `SmeGemm` — build-once/call-many tiled SGEMM kernel. Owns weights/bias, validates dimensions, exposes `run()` and `run_row_major()`.
+   - `SmeMlp` — fused multi-layer MLP. Owns all data, compiles into single JitPage. `run()` and `run_row_major()`.
+   - `LayerConfig` — declarative layer specification (n, weights, bias, activation).
+   - `SmeError` — proper error enum with `Display`/`Error` impls. No more `.unwrap()` in the public path.
+   - `Activation` re-exported from `api` module (users don't need to import `emitter`).
+
+2. **`lib.rs` — Public re-exports**:
+   - `pub use api::{SmeGemm, SmeMlp, LayerConfig, Activation, SmeError}`
+   - Internal modules remain `pub` for power users and benchmarks.
+   - Module-level rustdoc with quick-start pointers.
+
+3. **Criterion benchmarks expanded** — 5 groups:
+   - `accelerate` — cblas_sgemm baseline at 16×16×K
+   - `jit_cold` — fork-isolated kernel (measures safety harness overhead)
+   - `jit_hot` — direct JitPage call (bare-metal throughput)
+   - `fused` — GEMM+ReLU, GEMM+Bias+ReLU
+   - `tiled` — **NEW**: SmeGemm API at 16×16, 32×32, 48×48, 64×64 vs Accelerate
+
+4. **Cargo.toml metadata**:
+   - Version bumped to 0.2.0
+   - `license = "MIT OR Apache-2.0"`
+   - `keywords`, `categories`, `readme` fields populated
+   - Ready for crate distribution (not published — M4-only)
+
+**Usage example** (SmeGemm):
+```rust
+use sme_jit_core::{SmeGemm, Activation};
+
+let kernel = SmeGemm::new(16, 16, 32, &weights, None, Activation::None)?;
+kernel.run(&input_col_major, &mut output);
+```
+
+**Usage example** (SmeMlp):
+```rust
+use sme_jit_core::{SmeMlp, LayerConfig, Activation};
+
+let mut mlp = SmeMlp::new(784, &[
+    LayerConfig { n: 48, weights: w1, bias: b1, activation: Activation::BiasReLU },
+    LayerConfig { n: 48, weights: w2, bias: b2, activation: Activation::BiasReLU },
+    LayerConfig { n: 16, weights: w3, bias: b3, activation: Activation::Bias },
+])?;
+mlp.run(&input_col_major, &mut output);
+```
+
+## Gate 25: Blog Post & CI (Future)
+
+**Goal**: Write-up and infrastructure.
 
 **Deliverables**:
 1. Blog post: "Beating Accelerate.framework on M4: A JIT SME Adventure"
-2. Clean public API: `SmeGemm::new(m, n, k) → kernel.run(a, b, c)`
-3. Criterion benchmarks updated for all gate results
-4. GitHub Actions CI (build-only, M4 hardware not available in CI)
-5. Crate documentation with architecture diagrams
+2. GitHub Actions CI (build-only, M4 hardware not available in CI)
+3. Architecture diagrams for documentation
 
 ## Deferred (from original roadmap)
 

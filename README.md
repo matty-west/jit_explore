@@ -94,6 +94,7 @@ These parameters were discovered through empirical instruction probing — not f
 | 21 | **Tiled GEMM — arbitrary M×N up to 128×128, 5× at 16×16** | ✅ |
 | 22 | **Tiled inference — 784→48→48→10 MLP, 1.13× vs Accelerate** | ✅ |
 | 23 | **Monolithic fused kernel — 1.55× vs Accelerate, 3.0 μs/batch** | ✅ |
+| 24 | **Clean public API** — `SmeGemm`, `SmeMlp`, `SmeError`, Criterion benchmarks | ✅ |
 
 See [ROADMAP.md](ROADMAP.md) for detailed findings and architecture notes.
 
@@ -101,6 +102,7 @@ See [ROADMAP.md](ROADMAP.md) for detailed findings and architecture notes.
 
 ```
 src/
+  api.rs               Public API — SmeGemm, SmeMlp, LayerConfig, SmeError
   main.rs              Gate runner (entry point)
   emitter.rs           AArch64/SME instruction encoding + SGEMM kernel builder
   probe.rs             Fork-based opcode probing and block execution

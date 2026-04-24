@@ -1,18 +1,21 @@
 //! Crucible benchmark suite — SME SGEMM vs Accelerate.
 //!
-//! Measures three execution paths for 16×16 matrix multiplication:
+//! Five benchmark groups covering the full performance stack:
 //!
-//! | Group        | What is measured |
-//! |--------------|-----------------|
-//! | `accelerate` | Raw `cblas_sgemm` via Accelerate.framework — the floor. |
-//! | `jit_cold`   | SME SGEMM kernel through the fork-based safety harness. |
-//! | `jit_hot`    | SME SGEMM kernel via direct JIT page call (bare-metal). |
+//! | Group            | What is measured |
+//! |------------------|-----------------|
+//! | `accelerate`     | Raw `cblas_sgemm` via Accelerate.framework — the floor. |
+//! | `jit_cold`       | SME SGEMM kernel through the fork-based safety harness. |
+//! | `jit_hot`        | SME SGEMM kernel via direct JIT page call (bare-metal). |
+//! | `fused`          | GEMM + ReLU and GEMM + Bias + ReLU fused kernels. |
+//! | `tiled`          | Tiled SGEMM at various sizes (16–128) via public API. |
 //!
 //! ## Running
 //! ```sh
 //! cargo bench
 //! cargo bench -- accelerate    # just Accelerate baseline
 //! cargo bench -- jit_hot       # just bare-metal JIT
+//! cargo bench -- tiled         # just tiled GEMM sweep
 //! ```
 //!
 //! HTML reports land in `target/criterion/`.
@@ -21,6 +24,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 use sme_jit_core::emitter::{build_sme_sgemm_16x16, build_sme_sgemm_page, Activation};
 use sme_jit_core::probe::{Probe, SharedMemory};
+use sme_jit_core::api::SmeGemm;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -240,6 +244,84 @@ fn bench_fused(c: &mut Criterion) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Group 5: Tiled GEMM via public API (SmeGemm)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn bench_tiled(c: &mut Criterion) {
+    wake_hardware();
+
+    let mut group = c.benchmark_group("tiled");
+    group.sample_size(300);
+
+    // Sizes to sweep — all square, K = N for simplicity
+    let sizes: &[(usize, usize, usize)] = &[
+        (16, 16, 16),
+        (32, 32, 32),
+        (48, 48, 48),
+        (64, 64, 64),
+    ];
+
+    for &(m, n, k) in sizes {
+        let label = format!("{m}x{n}x{k}");
+
+        // ── JIT (via SmeGemm API) ──
+        let weights = vec![1.0f32; k * n];
+        // Column-major input [K × M]
+        let a_col = vec![1.0f32; k * m];
+        let mut c_jit = vec![0.0f32; m * n];
+
+        let kernel = match SmeGemm::new(m, n, k, &weights, None, Activation::None) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[bench] tiled {label}: skipped ({e})");
+                continue;
+            }
+        };
+
+        // Verify correctness first
+        kernel.run(&a_col, &mut c_jit);
+        let expected = k as f32;
+        if (c_jit[0] - expected).abs() > 1e-3 {
+            eprintln!("[bench] tiled {label}: bad output {}, expected {expected}", c_jit[0]);
+            continue;
+        }
+
+        group.bench_with_input(BenchmarkId::new("jit", &label), &(), |b_iter, &()| {
+            b_iter.iter(|| {
+                kernel.run(black_box(&a_col), black_box(&mut c_jit));
+                black_box(&c_jit);
+            });
+        });
+
+        // ── Accelerate baseline at same size ──
+        let a_accel = vec![1.0f32; m * k];
+        let b_accel = vec![1.0f32; k * n];
+        let mut c_accel = vec![0.0f32; m * n];
+
+        group.bench_with_input(BenchmarkId::new("accelerate", &label), &(), |b_iter, &()| {
+            b_iter.iter(|| {
+                unsafe {
+                    sme_jit_core::crucible::cblas_sgemm(
+                        sme_jit_core::crucible::CblasOrder::RowMajor,
+                        sme_jit_core::crucible::CblasTranspose::NoTrans,
+                        sme_jit_core::crucible::CblasTranspose::NoTrans,
+                        m as i32, n as i32, k as i32,
+                        1.0,
+                        a_accel.as_ptr(), k as i32,
+                        b_accel.as_ptr(), n as i32,
+                        0.0,
+                        c_accel.as_mut_ptr(), n as i32,
+                    );
+                }
+                black_box(&c_accel);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Criterion entry points
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -249,5 +331,6 @@ criterion_group!(
     bench_jit_cold,
     bench_jit_hot,
     bench_fused,
+    bench_tiled,
 );
 criterion_main!(benches);
