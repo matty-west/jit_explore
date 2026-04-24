@@ -12,6 +12,7 @@ __pycache__/
 
 # Model weights (regenerate with: python scripts/train_mnist.py)
 scripts/weights/
+scripts/weights_wide/
 
 # Frida heist outputs (contain extracted proprietary code)
 *.json

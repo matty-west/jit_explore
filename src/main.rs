@@ -1239,6 +1239,149 @@ fn gate21_bench() {
     println!("✓ gate 21 microbenchmark complete\n");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 22: Tiled Inference Engine — Wider Hidden Layers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate_22() {
+    use crate::weights::{MnistWeightsWide, MnistTestBatchWide};
+    use crate::inference::{TiledInferenceEngine, run_inference_reference_wide};
+    use crate::crucible::Crucible;
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 22: Tiled Inference Engine — Wider Hidden Layers");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+
+    let weights_dir = std::path::Path::new("scripts/weights_wide");
+
+    // ── Load weights ──
+    let weights = match MnistWeightsWide::load(weights_dir) {
+        Ok(w) => {
+            let h = w.hidden_dim;
+            println!("  ✓ Weights loaded (hidden={})", h);
+            println!("    W1: 784×{} = {} floats", h, w.w1.len());
+            println!("    W2: {}×{} = {} floats", h, h, w.w2.len());
+            println!("    W3: {}×16 = {} floats (padded from {}×10)", h, w.w3.len(), h);
+            w
+        }
+        Err(e) => {
+            println!("  [✗] Failed to load weights: {}", e);
+            println!("  Run: .venv/bin/python scripts/train_mnist_wide.py");
+            return;
+        }
+    };
+
+    let test = match MnistTestBatchWide::load(weights_dir, weights.hidden_dim) {
+        Ok(t) => {
+            println!("  ✓ Test batch loaded: {} images, labels: {:?}", t.labels.len(), t.labels);
+            t
+        }
+        Err(e) => {
+            println!("  [✗] Failed to load test batch: {}", e);
+            return;
+        }
+    };
+    println!();
+
+    let h = weights.hidden_dim;
+
+    // ── Step 1: Reference inference (Accelerate) ──
+    println!("  [1] Reference inference (Accelerate, hidden={})...", h);
+    let (ref_preds, ref_h1, ref_h2, ref_out) =
+        run_inference_reference_wide(&weights, &test.images);
+    let ref_correct = ref_preds.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+    println!("    Predictions: {:?}", ref_preds);
+    println!("    Correct: {}/16", ref_correct);
+    println!();
+
+    // ── Step 2: Build tiled engine ──
+    println!("  [2] Building tiled inference engine...");
+    let build_start = std::time::Instant::now();
+    let mut engine = match TiledInferenceEngine::build(&weights) {
+        Ok(e) => e,
+        Err(e) => { println!("    [✗] Build failed: {}", e); return; }
+    };
+    let build_time = build_start.elapsed();
+    println!("    Build time: {:.1} μs", build_time.as_nanos() as f64 / 1000.0);
+    println!();
+
+    // ── Step 3: Correctness — pretransposed path ──
+    println!("  [3] JIT inference (pretransposed)...");
+    let jit_preds = engine.run_pretransposed(&test.images_t);
+    let jit_correct = jit_preds.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+    println!("    Predictions: {:?}", jit_preds);
+    println!("    Correct: {}/16", jit_correct);
+
+    // ── Differential correctness ──
+    let preds_match = jit_preds == ref_preds;
+    let mut out_diff = 0.0f32;
+    for i in 0..16 {
+        for j in 0..10 {
+            let d = (ref_out[i * 16 + j] - engine.output()[i * 16 + j]).abs();
+            if d > out_diff { out_diff = d; }
+        }
+    }
+    println!("    Predictions match ref: {}", if preds_match { "YES" } else { "NO" });
+    println!("    Output max_diff (first 10 cols): {:.2e}", out_diff);
+    println!();
+
+    // ── Step 4: Benchmark ──
+    println!("  [4] Benchmark (1000 iterations)...");
+    let iterations = 1000;
+
+    // Accelerate
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = run_inference_reference_wide(&weights, &test.images);
+    }
+    let accel_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Tiled JIT (pretransposed)
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = engine.run_pretransposed(&test.images_t);
+    }
+    let jit_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    // Tiled JIT (with transpose)
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let _ = engine.run(&test.images);
+    }
+    let jit_trans_ns = start.elapsed().as_nanos() as f64 / iterations as f64;
+
+    let speedup = accel_ns / jit_ns;
+
+    println!("    Accelerate:            {:>7.0} ns ({:.1} μs)", accel_ns, accel_ns / 1000.0);
+    println!("    Tiled JIT (pretrans):   {:>7.0} ns ({:.1} μs)", jit_ns, jit_ns / 1000.0);
+    println!("    Tiled JIT (transpose):  {:>7.0} ns ({:.1} μs)", jit_trans_ns, jit_trans_ns / 1000.0);
+    println!("    vs Accelerate:          {:.2}×", speedup);
+    println!();
+
+    if preds_match && out_diff < 10.0 {
+        println!("  ████████████████████████████████████████████████████████████");
+        println!("  █                                                          █");
+        println!("  █   🧠 GATE 22 — TILED INFERENCE ENGINE  🧠               █");
+        println!("  █                                                          █");
+        println!("  █   Architecture: 784→{}→{}→10                           █", h, h);
+        println!("  █   Correct: {}/16, max_diff={:.2e}                    █", jit_correct, out_diff);
+        println!("  █   Pretransposed: {:.1} μs  ({:.2}× vs Accelerate)     █", jit_ns / 1000.0, speedup);
+        println!("  █   Build time: {:.1} μs (one-time)                      █", build_time.as_nanos() as f64 / 1000.0);
+        println!("  █                                                          █");
+        println!("  ████████████████████████████████████████████████████████████");
+    } else {
+        println!("  [!] Gate 22 FAILED — preds_match={}, out_diff={:.2e}", preds_match, out_diff);
+        println!("    JIT:  {:?}", jit_preds);
+        println!("    REF:  {:?}", ref_preds);
+    }
+
+    println!();
+    println!("✓ gate 22 complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
@@ -1246,6 +1389,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
+    } else if args.contains(&"gate22".to_string()) {
+        gate_22();
     } else if args.contains(&"bench21".to_string()) {
         gate21_bench();
     } else if args.contains(&"gate21".to_string()) {
