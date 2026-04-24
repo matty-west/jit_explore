@@ -9,7 +9,9 @@
 pub mod cpu_state;
 pub mod crucible;
 pub mod emitter;
+pub mod inference;
 pub mod jit_page;
 pub mod probe;
 pub mod signal_handler;
 pub mod sink;
+pub mod weights;

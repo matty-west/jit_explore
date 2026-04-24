@@ -4,10 +4,12 @@
 mod cpu_state;
 mod crucible;
 mod emitter;
+mod inference;
 mod jit_page;
 mod probe;
 mod signal_handler;
 mod sink;
+mod weights;
 
 use signal_handler::install_sigill_handler;
 
@@ -561,6 +563,162 @@ fn discovery_sweep() {
     println!();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 18: Tiny Inference Engine — MNIST MLP via JIT'd SME Kernels
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn gate_18() {
+    use crate::weights::{MnistWeights, MnistTestBatch};
+    use crate::inference::{run_inference_probed, run_inference_reference, run_inference_direct};
+    use crate::crucible::Crucible;
+
+    println!("══════════════════════════════════════════════════════════════");
+    println!("  Gate 18: Tiny Inference Engine — MNIST MLP via SME JIT");
+    println!("══════════════════════════════════════════════════════════════");
+    println!();
+
+    // ── Load weights ──
+    let weights_dir = std::path::Path::new("scripts/weights");
+    let weights = match MnistWeights::load(weights_dir) {
+        Ok(w) => {
+            println!("  ✓ Weights loaded:");
+            println!("    W1: {}×16 = {} floats", 784, w.w1.len());
+            println!("    W2: 16×16 = {} floats", w.w2.len());
+            println!("    W3: 16×16 = {} floats (padded from 16×10)", w.w3.len());
+            w
+        }
+        Err(e) => {
+            println!("  [✗] Failed to load weights: {}", e);
+            println!("  Run: .venv/bin/python scripts/train_mnist.py");
+            return;
+        }
+    };
+
+    // ── Load test batch ──
+    let test = match MnistTestBatch::load(weights_dir) {
+        Ok(t) => {
+            println!("  ✓ Test batch loaded: {} images, labels: {:?}", t.labels.len(), t.labels);
+            t
+        }
+        Err(e) => {
+            println!("  [✗] Failed to load test batch: {}", e);
+            return;
+        }
+    };
+    println!();
+
+    // ── Step 1: Reference inference (Accelerate) ──
+    println!("  [1] Reference inference (Accelerate)...");
+    let (ref_preds, ref_h1, ref_h2, ref_out) =
+        run_inference_reference(&weights, &test.images);
+    println!("    Predictions: {:?}", ref_preds);
+    let ref_correct = ref_preds.iter().zip(test.labels.iter())
+        .filter(|(p, l)| *p == *l).count();
+    println!("    Correct: {}/16", ref_correct);
+    println!();
+
+    // ── Step 2: JIT inference (fork-probed, safe) ──
+    println!("  [2] JIT inference (fork-probed)...");
+    match run_inference_probed(&weights, &test.images) {
+        Ok((jit_preds, jit_h1, jit_h2, jit_out)) => {
+            println!("    Predictions: {:?}", jit_preds);
+            let jit_correct = jit_preds.iter().zip(test.labels.iter())
+                .filter(|(p, l)| *p == *l).count();
+            println!("    Correct: {}/16", jit_correct);
+
+            // ── Differential correctness ──
+            let h1_diff = Crucible::max_abs_diff(&ref_h1, &jit_h1);
+            let h2_diff = Crucible::max_abs_diff(&ref_h2, &jit_h2);
+            // Compare only first 10 columns of output (rest is padding)
+            let mut out_diff = 0.0f32;
+            for i in 0..16 {
+                for j in 0..10 {
+                    let d = (ref_out[i * 16 + j] - jit_out[i * 16 + j]).abs();
+                    if d > out_diff { out_diff = d; }
+                }
+            }
+
+            println!();
+            println!("    Layer-by-layer max_diff vs Accelerate:");
+            println!("      Hidden 1: {:.2e}", h1_diff);
+            println!("      Hidden 2: {:.2e}", h2_diff);
+            println!("      Output:   {:.2e} (first 10 cols)", out_diff);
+
+            let preds_match = jit_preds == ref_preds;
+            println!();
+            if preds_match && out_diff < 1.0 {
+                println!("  ████████████████████████████████████████████████████████████");
+                println!("  █                                                          █");
+                println!("  █   🧠  GATE 18 — MNIST INFERENCE VIA SME JIT  🧠         █");
+                println!("  █                                                          █");
+                println!("  █   3-layer MLP: 784→16→16→10                              █");
+                println!("  █   16 images classified, {}/16 correct                    █", jit_correct);
+                println!("  █   Predictions match Accelerate reference: {}            █",
+                    if preds_match { "YES" } else { "NO " });
+                println!("  █   Max output diff: {:.2e}                              █", out_diff);
+                println!("  █                                                          █");
+                println!("  █   Zero frameworks. Zero dispatch. Pure silicon.          █");
+                println!("  █                                                          █");
+                println!("  ████████████████████████████████████████████████████████████");
+            } else {
+                println!("  [!] Predictions don't match or diff too large.");
+                println!("    JIT:  {:?}", jit_preds);
+                println!("    REF:  {:?}", ref_preds);
+            }
+        }
+        Err(e) => {
+            println!("    [✗] JIT inference failed: {}", e);
+        }
+    }
+    println!();
+
+    // ── Step 3: Direct JIT inference (performance path) ──
+    println!("  [3] Direct JIT inference (no fork)...");
+    match run_inference_direct(&weights, &test.images) {
+        Ok(direct_preds) => {
+            println!("    Predictions: {:?}", direct_preds);
+            let direct_correct = direct_preds.iter().zip(test.labels.iter())
+                .filter(|(p, l)| *p == *l).count();
+            println!("    Correct: {}/16", direct_correct);
+
+            // ── Benchmark: JIT vs Accelerate ──
+            println!();
+            println!("  [4] Benchmark: JIT vs Accelerate (100 iterations)...");
+            let iterations = 100;
+
+            // Accelerate timing
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                let _ = run_inference_reference(&weights, &test.images);
+            }
+            let accel_elapsed = start.elapsed();
+            let accel_per_iter = accel_elapsed.as_nanos() as f64 / iterations as f64;
+
+            // JIT timing
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                let _ = run_inference_direct(&weights, &test.images);
+            }
+            let jit_elapsed = start.elapsed();
+            let jit_per_iter = jit_elapsed.as_nanos() as f64 / iterations as f64;
+
+            let speedup = accel_per_iter / jit_per_iter;
+            let framework_tax = ((accel_per_iter / jit_per_iter) - 1.0) * 100.0;
+
+            println!("    Accelerate: {:.0} ns/batch ({:.1} μs)", accel_per_iter, accel_per_iter / 1000.0);
+            println!("    JIT direct: {:.0} ns/batch ({:.1} μs)", jit_per_iter, jit_per_iter / 1000.0);
+            println!("    Speedup:    {:.2}×", speedup);
+            println!("    Framework tax: {:.0}%", framework_tax);
+        }
+        Err(e) => {
+            println!("    [✗] Direct JIT inference failed: {}", e);
+        }
+    }
+
+    println!();
+    println!("✓ gate 18 complete\n");
+}
+
 fn main() {
     install_sigill_handler();
     
@@ -568,6 +726,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.contains(&"sweep".to_string()) {
         gate_latency_sweep();
+    } else if args.contains(&"gate18".to_string()) {
+        gate_18();
     } else {
         discovery_sweep();
         gate_14d();
@@ -577,6 +737,7 @@ fn main() {
         gate_17b();
         gate_17c();
         gate_performance();
+        gate_18();
     }
 }
 
