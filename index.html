@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sme-jit-core — Benchmark Results</title>
+<style>
+  :root { --bg: #0d1117; --fg: #e6edf3; --accent: #58a6ff; --card: #161b22; --border: #30363d; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.6; padding: 2rem; max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+  h1 span { color: var(--accent); }
+  .subtitle { color: #8b949e; margin-bottom: 2rem; font-size: 1.1rem; }
+  .subtitle a { color: var(--accent); text-decoration: none; }
+  .subtitle a:hover { text-decoration: underline; }
+  h2 { font-size: 1.3rem; margin: 2rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; }
+  th, td { padding: 0.6rem 1rem; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: #8b949e; font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  td { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.95rem; }
+  .win { color: var(--green); font-weight: 600; }
+  .lose { color: var(--red); }
+  .note { color: var(--yellow); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; margin: 1rem 0; }
+  .card h3 { font-size: 1rem; margin-bottom: 0.5rem; }
+  .card p { color: #8b949e; font-size: 0.9rem; }
+  a.report-link { display: inline-block; background: var(--accent); color: var(--bg); padding: 0.4rem 1rem; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 0.85rem; margin: 0.3rem 0.3rem 0.3rem 0; }
+  a.report-link:hover { opacity: 0.85; }
+  .footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: #8b949e; font-size: 0.85rem; text-align: center; }
+  .badge { display: inline-block; background: var(--green); color: var(--bg); padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 700; margin-left: 0.5rem; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+<h1><span>sme-jit-core</span> Benchmarks</h1>
+<p class="subtitle">
+  ARM SME JIT vs Apple Accelerate on M4 · Criterion.rs · 
+  <a href="https://github.com/Dawn-State/sme-jit-core">Source on GitHub</a>
+</p>
+
+<h2>Tiled GEMM — SmeGemm API</h2>
+<table>
+  <tr><th>Size</th><th>JIT (median)</th><th>Accelerate (median)</th><th>Speedup</th></tr>
+  <tr><td>16×16×16</td><td>58.2 ns</td><td>218.1 ns</td><td class="win">3.7×</td></tr>
+  <tr><td>32×32×32</td><td>85.9 ns</td><td>260.1 ns</td><td class="win">3.0×</td></tr>
+  <tr><td>48×48×48</td><td>339.2 ns</td><td>495.3 ns</td><td class="win">1.5×</td></tr>
+  <tr><td>64×64×64</td><td>867.9 ns</td><td>712.9 ns</td><td class="lose">0.8×</td></tr>
+</table>
+<p>
+  <a class="report-link" href="tiled/jit/report/index.html">JIT Detail</a>
+  <a class="report-link" href="tiled/accelerate/report/index.html">Accelerate Detail</a>
+  <a class="report-link" href="tiled/report/index.html">Comparison</a>
+</p>
+
+<h2>Fused Activations — GEMM + ReLU / Bias+ReLU</h2>
+<table>
+  <tr><th>Kernel</th><th>Median</th><th>Note</th></tr>
+  <tr><td>sgemm_relu_16×16</td><td>39.9 ns</td><td class="note">ReLU adds ~0 ns over raw GEMM</td></tr>
+  <tr><td>sgemm_bias_relu_16×16</td><td>41.5 ns</td><td class="note">Bias+ReLU adds 1.6 ns</td></tr>
+</table>
+<p>
+  <a class="report-link" href="fused/sgemm_relu_16x16/report/index.html">ReLU Detail</a>
+  <a class="report-link" href="fused/sgemm_bias_relu_16x16/report/index.html">Bias+ReLU Detail</a>
+  <a class="report-link" href="fused/report/index.html">Comparison</a>
+</p>
+
+<h2>Core 16×16 — JIT Hot vs Cold vs Accelerate</h2>
+<table>
+  <tr><th>Path</th><th>K=1</th><th>K=4</th><th>K=16</th><th>K=64</th></tr>
+  <tr><td>jit_hot</td><td>58.1 ns</td><td>58.3 ns</td><td>58.5 ns</td><td>56.7 ns</td></tr>
+  <tr><td>accelerate</td><td>50.0 ns</td><td>117.7 ns</td><td>162.2 ns</td><td>232.7 ns</td></tr>
+  <tr><td><em>speedup</em></td><td class="lose">0.9×</td><td class="win">2.0×</td><td class="win">2.8×</td><td class="win">4.1×</td></tr>
+</table>
+
+<div class="card">
+  <h3>jit_cold (fork-isolated) <span class="badge">safety mode</span></h3>
+  <p>Median ~44 ms — 750,000× slower than jit_hot. This is the fork()+mmap+waitpid cost for fault-tolerant opcode probing. Used for exploring unknown instructions, not production workloads.</p>
+</div>
+
+<p>
+  <a class="report-link" href="jit_hot/report/index.html">JIT Hot Detail</a>
+  <a class="report-link" href="jit_cold/report/index.html">JIT Cold Detail</a>
+  <a class="report-link" href="accelerate/report/index.html">Accelerate Detail</a>
+</p>
+
+<h2>Methodology</h2>
+<div class="card">
+  <h3>Criterion.rs — Statistical Benchmarking</h3>
+  <p>300–500 samples per benchmark with 3-second warmup. Outlier detection via modified Thompson Tau. 
+  Confidence intervals at 95%. All measurements on Apple M4, macOS Sequoia 15.x, Rust nightly, 
+  <code>--release</code> profile. Benchmarks exercise the public <code>SmeGemm</code> API (tiled group) 
+  and internal kernel builders (other groups).</p>
+</div>
+
+<h2>Full Criterion Report</h2>
+<p><a class="report-link" href="report/index.html">View All Benchmarks →</a></p>
+
+<div class="footer">
+  <p>Dawn State · Silicon → Models → Swarms · <a href="https://github.com/Dawn-State" style="color: var(--accent);">github.com/Dawn-State</a></p>
+</div>
+
+</body>
+</html>

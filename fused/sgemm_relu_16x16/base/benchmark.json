@@ -1,0 +1,1 @@
+{"group_id":"fused","function_id":"sgemm_relu_16x16","value_str":null,"throughput":null,"full_id":"fused/sgemm_relu_16x16","directory_name":"fused/sgemm_relu_16x16","title":"fused/sgemm_relu_16x16"}
