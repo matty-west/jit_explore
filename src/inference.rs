@@ -8,9 +8,9 @@
 //!
 //! Batch=16: all three layers operate on full 16×16 ZA tiles.
 
-use crate::emitter::{build_sme_sgemm_page, build_sme_sgemm_page_cached, Activation};
+use crate::emitter::{build_sme_sgemm_page, build_sme_sgemm_page_cached, build_sme_tiled_sgemm_page_cached, Activation};
 use crate::jit_page::JitPage;
-use crate::weights::MnistWeights;
+use crate::weights::{MnistWeights, MnistWeightsWide};
 
 /// A **cached** 3-layer MLP inference engine (Gate 19).
 ///
@@ -481,6 +481,201 @@ pub fn run_inference_reference(
         let pred = row
             .iter()
             .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(idx, _)| idx as u8)
+            .unwrap_or(0);
+        predictions.push(pred);
+    }
+
+    (predictions, hidden1, hidden2, output)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Gate 22: Tiled Inference Engine — Wider Hidden Layers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A tiled inference engine for wider models (Gate 22).
+///
+/// Uses `build_sme_tiled_sgemm_page_cached` for arbitrary M×N×K dimensions.
+/// Architecture: 784 → H → H → 10 (H = hidden_dim, must be multiple of 16).
+///
+/// Layer dimensions (batch=16):
+///   Layer 1: M=16, N=H, K=784 → output [16×H]
+///   Layer 2: M=16, N=H, K=H   → output [16×H]
+///   Layer 3: M=16, N=16, K=H  → output [16×16] (padded from 10)
+pub struct TiledInferenceEngine {
+    hidden_dim: usize,
+    page1: JitPage,
+    page2: JitPage,
+    page3: JitPage,
+    /// Pre-allocated buffers
+    hidden1: Vec<f32>,      // 16 × H (row-major output from layer 1)
+    hidden1_t: Vec<f32>,    // H × 16 (column-major input for layer 2)
+    hidden2: Vec<f32>,      // 16 × H
+    hidden2_t: Vec<f32>,    // H × 16
+    output: Vec<f32>,       // 16 × 16 (padded)
+}
+
+impl TiledInferenceEngine {
+    /// Build the tiled inference engine.
+    ///
+    /// Weight pointers are baked into the JIT pages — `weights` must outlive the engine.
+    pub fn build(weights: &MnistWeightsWide) -> Result<Self, String> {
+        let h = weights.hidden_dim;
+        assert!(h % 16 == 0, "hidden_dim must be multiple of 16, got {}", h);
+
+        // Layer 1: M=16, N=H, K=784, BiasReLU
+        let page1 = build_sme_tiled_sgemm_page_cached(
+            16, h, 784, Activation::BiasReLU,
+            weights.w1.as_ptr() as u64,
+            weights.b1.as_ptr() as u64,
+        ).ok_or("Failed to build tiled Layer 1 page")?;
+
+        // Layer 2: M=16, N=H, K=H, BiasReLU
+        let page2 = build_sme_tiled_sgemm_page_cached(
+            16, h, h, Activation::BiasReLU,
+            weights.w2.as_ptr() as u64,
+            weights.b2.as_ptr() as u64,
+        ).ok_or("Failed to build tiled Layer 2 page")?;
+
+        // Layer 3: M=16, N=16, K=H, Bias (output padded from 10→16)
+        let page3 = build_sme_tiled_sgemm_page_cached(
+            16, 16, h, Activation::Bias,
+            weights.w3.as_ptr() as u64,
+            weights.b3.as_ptr() as u64,
+        ).ok_or("Failed to build tiled Layer 3 page")?;
+
+        Ok(Self {
+            hidden_dim: h,
+            page1, page2, page3,
+            hidden1: vec![0.0f32; 16 * h],
+            hidden1_t: vec![0.0f32; h * 16],
+            hidden2: vec![0.0f32; 16 * h],
+            hidden2_t: vec![0.0f32; h * 16],
+            output: vec![0.0f32; 16 * 16],
+        })
+    }
+
+    /// Run inference with pre-transposed input [784×16].
+    ///
+    /// Returns: predictions[16]
+    pub fn run_pretransposed(&mut self, images_t: &[f32]) -> Vec<u8> {
+        assert_eq!(images_t.len(), 784 * 16, "Expected 784×16 pre-transposed input");
+        let h = self.hidden_dim;
+
+        // ── Layer 1: images_t[784×16] → hidden1[16×H] ──
+        // SAFETY: page1 is a valid tiled kernel, pointers are valid.
+        unsafe {
+            self.page1.call_with_args(
+                images_t.as_ptr() as u64,
+                self.hidden1.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Transpose hidden1: [16×H] row-major → [H×16] column-major ──
+        for i in 0..16 {
+            for j in 0..h {
+                self.hidden1_t[j * 16 + i] = self.hidden1[i * h + j];
+            }
+        }
+
+        // ── Layer 2: hidden1_t[H×16] → hidden2[16×H] ──
+        unsafe {
+            self.page2.call_with_args(
+                self.hidden1_t.as_ptr() as u64,
+                self.hidden2.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Transpose hidden2: [16×H] → [H×16] ──
+        for i in 0..16 {
+            for j in 0..h {
+                self.hidden2_t[j * 16 + i] = self.hidden2[i * h + j];
+            }
+        }
+
+        // ── Layer 3: hidden2_t[H×16] → output[16×16] ──
+        unsafe {
+            self.page3.call_with_args(
+                self.hidden2_t.as_ptr() as u64,
+                self.output.as_mut_ptr() as u64,
+            );
+        }
+
+        // ── Argmax over first 10 columns ──
+        let mut predictions = Vec::with_capacity(16);
+        for i in 0..16 {
+            let row = &self.output[i * 16..i * 16 + 10];
+            let pred = row.iter().enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as u8)
+                .unwrap_or(0);
+            predictions.push(pred);
+        }
+        predictions
+    }
+
+    /// Run inference with row-major input [16×784] (includes transpose).
+    pub fn run(&mut self, images: &[f32]) -> Vec<u8> {
+        assert_eq!(images.len(), 16 * 784, "Expected 16×784 input");
+        let mut input_t = vec![0.0f32; 784 * 16];
+        for i in 0..16 {
+            for k in 0..784 {
+                input_t[k * 16 + i] = images[i * 784 + k];
+            }
+        }
+        self.run_pretransposed(&input_t)
+    }
+
+    pub fn output(&self) -> &[f32] { &self.output }
+    pub fn hidden1(&self) -> &[f32] { &self.hidden1 }
+    pub fn hidden2(&self) -> &[f32] { &self.hidden2 }
+}
+
+/// Reference inference for wide model using Accelerate (cblas_sgemm).
+///
+/// Returns: (predictions, hidden1[16×H], hidden2[16×H], output[16×16])
+pub fn run_inference_reference_wide(
+    weights: &MnistWeightsWide,
+    images: &[f32],  // 16×784 row-major
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    use crate::crucible::Crucible;
+    let h = weights.hidden_dim;
+
+    // Layer 1: images[16×784] × W1[784×H] + b1, ReLU
+    let h1_raw = Crucible::run_accelerate(16, h, 784, images, &weights.w1);
+    let mut hidden1 = vec![0.0f32; 16 * h];
+    for i in 0..16 {
+        for j in 0..h {
+            let val = h1_raw[i * h + j] + weights.b1[j];
+            hidden1[i * h + j] = val.max(0.0);
+        }
+    }
+
+    // Layer 2: hidden1[16×H] × W2[H×H] + b2, ReLU
+    let h2_raw = Crucible::run_accelerate(16, h, h, &hidden1, &weights.w2);
+    let mut hidden2 = vec![0.0f32; 16 * h];
+    for i in 0..16 {
+        for j in 0..h {
+            let val = h2_raw[i * h + j] + weights.b2[j];
+            hidden2[i * h + j] = val.max(0.0);
+        }
+    }
+
+    // Layer 3: hidden2[16×H] × W3[H×16] + b3 (no ReLU, padded output)
+    let out_raw = Crucible::run_accelerate(16, 16, h, &hidden2, &weights.w3);
+    let mut output = vec![0.0f32; 16 * 16];
+    for i in 0..16 {
+        for j in 0..16 {
+            output[i * 16 + j] = out_raw[i * 16 + j] + weights.b3[j];
+        }
+    }
+
+    // Argmax over first 10 columns
+    let mut predictions = Vec::with_capacity(16);
+    for i in 0..16 {
+        let row = &output[i * 16..i * 16 + 10];
+        let pred = row.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(idx, _)| idx as u8)
             .unwrap_or(0);
