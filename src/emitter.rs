@@ -1507,6 +1507,113 @@ pub fn build_gate27_page(k: usize, a_ptr: u64, b_ptr: u64, c_ptr: u64)
     Some(page)
 }
 
+/// Gate 27.5 probe A — row-edge FMOPA with **separate** row/col predicates.
+///
+/// P1 = row-0-only (WHILELT, set **once** before the loop — not refreshed per iter).
+/// P0 = all-true (PTRUE).
+/// FMOPA: `ZA0.S, P1/M, P0/M` — P1 governs rows, P0 governs cols.
+///
+/// Probes: does FMOPA corrupt P1 when P1 is the ROW predicate only (not col)?
+/// If `c[j] == Σ a[i]*b[i*16+j]` for all j, P1 survived unchanged → no corruption.
+pub fn build_gate27p5_row_edge(k: usize, a_ptr: u64, b_ptr: u64, c_ptr: u64)
+    -> Option<crate::jit_page::JitPage>
+{
+    assert!(k >= 1 && k <= 65535);
+    let mut insns: Vec<u32> = Vec::with_capacity(80);
+
+    insns.extend(emit_load_imm64_vec(0, a_ptr));   // X0 = a_ptr (K scalars)
+    insns.extend(emit_load_imm64_vec(1, b_ptr));   // X1 = b_ptr (K × 16 floats)
+    insns.extend(emit_load_imm64_vec(2, c_ptr));   // X2 = c_ptr (16-float output)
+    insns.push(encode_mov_xzr(3));                 // X3 = 0 (A scalar index)
+    insns.push(encode_mov_xzr(6));                 // X6 = 0 (B vector index)
+    insns.push(encode_movz_x(8, k as u16, 0));     // X8 = K
+    insns.push(encode_movz_x(14, 0, 0));           // X14 = 0
+    insns.push(encode_movz_x(15, 1, 0));           // X15 = 1
+
+    insns.push(SMSTART);
+    insns.push(PTRUE_P0_S);                                   // P0 = all-true
+    insns.push(ZERO_ZA);
+    insns.push(encode_sve_whilelt_s(1, 14, 15));              // P1 = {T,F,…,F} — set ONCE
+
+    // 7-instruction loop: BNE at [6] → [0] = −24 bytes
+    insns.push(encode_sve_ld1w_ss(0, 1, 0, 3));              // [0] Z0[0] = a[X3]
+    insns.push(encode_sve_ld1w_ss(1, 0, 1, 6));              // [1] Z1[0..15] = b[X6..X6+15]
+    insns.push(encode_sme_fmopa(0, 0, 1, 1, 0));             // [2] ZA0 P1/M(row) P0/M(col)
+    insns.push(encode_add_x_imm(3, 3, 1));                   // [3] X3++
+    insns.push(encode_add_x_imm(6, 6, 16));                  // [4] X6 += 16
+    insns.push(encode_subs_x_imm(8, 8, 1));                  // [5] X8--
+    insns.push(encode_b_ne(-6 * 4));                         // [6] B.NE [0]
+
+    insns.push(encode_movz_x(12, 0, 0));                     // W12 = 0 (ZA row 0)
+    insns.push(encode_mov_xzr(3));                           // X3 = 0
+    insns.push(encode_sme_st1w_za_h(0, 0, 0, 2, 3));        // ST1W ZA0H[W12,#0], P0, [X2]
+    insns.push(SMSTOP);
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+    for (i, &op) in insns.iter().enumerate() { page.write_instruction(i * 4, op); }
+    page.make_executable();
+    Some(page)
+}
+
+/// Gate 27.5 probe B — col-edge FMOPA with **separate** row/col predicates.
+///
+/// P0 = all-true (PTRUE). P1 = col-0-only (WHILELT, set **once** — not refreshed).
+/// FMOPA: `ZA0.S, P0/M, P1/M` — P0 governs rows, P1 governs cols.
+///
+/// Two output stores:
+/// - `c_ptr` (16 floats): ZA row 0 via **P0** — ground truth; c[0]=Σ a[i*16]*b[i], c[1..15]=0.0
+/// - `d_ptr` (16 floats, pre-filled with sentinel): ZA row 0 via **P1** — tests predicated ZA store;
+///   if working: d[0]=c[0], d[1..15]=sentinel; if broken: d[1..15] get overwritten.
+pub fn build_gate27p5_col_edge(k: usize, a_ptr: u64, b_ptr: u64, c_ptr: u64, d_ptr: u64)
+    -> Option<crate::jit_page::JitPage>
+{
+    assert!(k >= 1 && k <= 65535);
+    let mut insns: Vec<u32> = Vec::with_capacity(80);
+
+    insns.extend(emit_load_imm64_vec(0, a_ptr));   // X0 = a_ptr (K × 16 floats)
+    insns.extend(emit_load_imm64_vec(1, b_ptr));   // X1 = b_ptr (K scalars)
+    insns.extend(emit_load_imm64_vec(2, c_ptr));   // X2 = c_ptr (P0-store output)
+    insns.extend(emit_load_imm64_vec(5, d_ptr));   // X5 = d_ptr (P1-store output)
+    insns.push(encode_mov_xzr(3));                 // X3 = 0 (A vector index, +16/iter)
+    insns.push(encode_mov_xzr(4));                 // X4 = 0 (B scalar index, +1/iter)
+    insns.push(encode_movz_x(8, k as u16, 0));     // X8 = K
+    insns.push(encode_movz_x(14, 0, 0));           // X14 = 0
+    insns.push(encode_movz_x(15, 1, 0));           // X15 = 1
+
+    insns.push(SMSTART);
+    insns.push(PTRUE_P0_S);                                   // P0 = all-true
+    insns.push(ZERO_ZA);
+    insns.push(encode_sve_whilelt_s(1, 14, 15));              // P1 = {T,F,…,F} — set ONCE
+
+    // 7-instruction loop: BNE at [6] → [0] = −24 bytes
+    insns.push(encode_sve_ld1w_ss(0, 0, 0, 3));              // [0] Z0[0..15] = a[X3..X3+15]
+    insns.push(encode_sve_ld1w_ss(1, 1, 1, 4));              // [1] Z1[0] = b[X4]
+    insns.push(encode_sme_fmopa(0, 0, 1, 0, 1));             // [2] ZA0 P0/M(row) P1/M(col)
+    insns.push(encode_add_x_imm(3, 3, 16));                  // [3] X3 += 16
+    insns.push(encode_add_x_imm(4, 4, 1));                   // [4] X4++
+    insns.push(encode_subs_x_imm(8, 8, 1));                  // [5] X8--
+    insns.push(encode_b_ne(-6 * 4));                         // [6] B.NE [0]
+
+    insns.push(encode_movz_x(12, 0, 0));                     // W12 = 0 (ZA row 0)
+    insns.push(encode_mov_xzr(3));                           // X3 = 0
+    insns.push(encode_sme_st1w_za_h(0, 0, 0, 2, 3));        // P0 store → c_ptr
+    insns.push(encode_sme_st1w_za_h(0, 0, 1, 5, 3));        // P1 store → d_ptr (probes ZA store)
+    insns.push(SMSTOP);
+    insns.push(RET);
+
+    let total_bytes = insns.len() * 4;
+    let page_size = ((total_bytes + 16383) / 16384) * 16384;
+    let page = crate::jit_page::JitPage::alloc(page_size).ok()?;
+    page.make_writable();
+    for (i, &op) in insns.iter().enumerate() { page.write_instruction(i * 4, op); }
+    page.make_executable();
+    Some(page)
+}
+
 /// Encode `LD1RW {Zt.S}, Pg/Z, [Xn, #imm]` — SVE load-and-replicate word.
 ///
 /// Loads a single 32-bit value from memory and broadcasts it to all S-element

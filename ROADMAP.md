@@ -2,7 +2,7 @@
 
 ## Where We Are
 
-Gates 0–24, 26–27 are complete. We have transitioned from the **Discovery Phase** (empirical probing) to the **Maturation Phase** (API stability and architectural scaling).
+Gates 0–24, 26–27, 27.5 are complete. We have transitioned from the **Discovery Phase** (empirical probing) to the **Maturation Phase** (API stability and architectural scaling).
 
 ### Status Summary
 - **Proven Performance:** 1.55× faster than Accelerate for full MNIST MLPs; 5.1× for 16×16 tiles.
@@ -454,6 +454,25 @@ Parametric encoder for `FMOPA ZAda.S, Pn/M, Pm/M, Zn.S, Zm.S`. Replaces four har
 - **`FMOPA ZA0.S, Pn/M, Pm/M, Zn, Zm` with non-trivial predicates works correctly.** Only ZA entries where both row-predicate (Pn) and col-predicate (Pm) lanes are active get updated. ✓
 - **`FMOPA P1/M, P1/M` modifies P1 as a side effect** after the first call on M4. ARM spec says predicates are read-only inputs to FMOPA — this is an undocumented M4 deviation. Workaround: re-run `WHILELT Pn` at the top of each FMOPA iteration to restore the mask.
 - **Predicated ZA stores (`ST1W ZA0H, Pg≠P0`) behave unexpectedly** after ≥2 FMOPA iterations (writes more lanes than predicate specifies). Root cause unknown. Workaround: use P0 (all-true) for ZA extraction; mask output in the caller if needed.
+
+### Gate 27.5: Separate-Predicate FMOPA Probe (Complete)
+**Goal:** Before committing Gate 28's full integration, probe whether the M4 quirks from Gate 27 (FMOPA corrupts P1; predicated ZA store misbehaves) reproduce when *separate* predicates are used for row and col masking — as a real tiled GEMM would use.
+**Status:** ✅ **Complete.**
+
+**Results:**
+
+| Probe | Question | Result |
+|:------|:---------|:-------|
+| A (P1=row, P0=col, P1 set once) | Does FMOPA corrupt P1 as row-only pred? | **NO** — max_diff ≤ 2.44e-4 (FP noise) for K=1,7,16,31 ✓ |
+| B (P0=row, P1=col, P1 set once) | Does FMOPA corrupt P1 as col-only pred? | **NO** — ZA cols 1-15 = 0.0 for all K; accumulation correct ✓ |
+| B-store (P1 predicated ST1W) | Does predicated ZA store work after K FMOPAs? | **YES** — d[0]=expected, d[1..15]=sentinel for all K ✓ |
+
+**Key discovery:** The Gate 27 "FMOPA P1/M, P1/M corrupts P1" quirk is **specific to using the same predicate as both row and col**. With separate predicates (e.g., P1=row, P0=col), neither predicate is modified across iterations. Predicated ZA stores work correctly when the store predicate is different from the FMOPA predicates.
+
+**Implications for Gate 28:**
+- Edge tiles can use `WHILELT P_row` and `WHILELT P_col` set **once** before the K-loop (no per-iter refresh needed).
+- Predicated `ST1W ZA0H, P_col` correctly writes only the active columns — no P0-store+trim workaround needed.
+- The two main risks blocking Gate 28 are resolved. Proceed.
 
 ### Gate 28: Arbitrary Tiled GEMM
 **Goal:** Integrate Gates 26 and 27 into the main `SmeGemm` tiled architecture.
