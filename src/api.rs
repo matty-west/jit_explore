@@ -72,7 +72,7 @@ impl std::fmt::Display for SmeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SmeError::BadDimension { name, value } =>
-                write!(f, "{name} must be a positive multiple of 16, got {value}"),
+                write!(f, "{name} must be 1..128, got {value}"),
             SmeError::WrongLength { name, expected, got } =>
                 write!(f, "{name}: expected {expected} elements, got {got}"),
             SmeError::PageAllocFailed =>
@@ -130,10 +130,10 @@ impl SmeGemm {
         act: Activation,
     ) -> Result<Self, SmeError> {
         // Validate dimensions
-        if m == 0 || m % 16 != 0 || m > 128 {
+        if m == 0 || m > 128 {
             return Err(SmeError::BadDimension { name: "M", value: m });
         }
-        if n == 0 || n % 16 != 0 || n > 128 {
+        if n == 0 || n > 128 {
             return Err(SmeError::BadDimension { name: "N", value: n });
         }
         if k == 0 || k > 65535 {
@@ -273,7 +273,7 @@ impl SmeMlp {
         // Validate dimensions
         let mut prev_n = input_k;
         for (i, layer) in layers.iter().enumerate() {
-            if layer.n == 0 || layer.n % 16 != 0 {
+            if layer.n == 0 || layer.n > 128 {
                 return Err(SmeError::BadDimension {
                     name: if i == 0 { "layer1.n" } else if i == 1 { "layer2.n" } else { "layer3.n" },
                     value: layer.n,
@@ -372,4 +372,136 @@ impl SmeMlp {
 
     /// Returns (input_k, output_n) dimensions.
     pub fn dims(&self) -> (usize, usize) { (self.input_k, self.output_n) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crucible::Accelerate;
+
+    #[test]
+    fn smegemm_arbitrary_dims() {
+        // Test an arbitrary non-16-multiple size: 17x43x91
+        let m = 17;
+        let n = 43;
+        let k = 91;
+
+        let weights = vec![1.0f32; k * n];
+        let input = vec![1.0f32; m * k];
+        let mut output = vec![0.0f32; m * n];
+        let mut expected = vec![0.0f32; m * n];
+
+        // Accelerate reference
+        Accelerate::sgemm(m, n, k, &input, &weights, &mut expected);
+
+        // JIT kernel
+        let kernel = SmeGemm::new(m, n, k, &weights, None, Activation::None).expect("build kernel");
+        kernel.run_row_major(&input, &mut output);
+
+        // Verify correctness
+        let mut max_diff = 0.0f32;
+        for i in 0..(m * n) {
+            max_diff = max_diff.max((output[i] - expected[i]).abs());
+        }
+        println!("Arbitrary GEMM {m}x{n}x{k} max_diff: {max_diff:e}");
+        assert!(max_diff < 1e-4, "GEMM max_diff too high: {max_diff:e}");
+    }
+
+    #[test]
+    fn smegemm_multiple_tiles() {
+        // Test a slightly larger size that is still not a multiple of 16: 33x33x33
+        let m = 33;
+        let n = 33;
+        let k = 33;
+
+        let weights = vec![0.5f32; k * n];
+        let input = vec![2.0f32; m * k];
+        let mut output = vec![0.0f32; m * n];
+        let mut expected = vec![0.0f32; m * n];
+
+        Accelerate::sgemm(m, n, k, &input, &weights, &mut expected);
+
+        let kernel = SmeGemm::new(m, n, k, &weights, None, Activation::None).expect("build kernel");
+        kernel.run_row_major(&input, &mut output);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..(m * n) {
+            max_diff = max_diff.max((output[i] - expected[i]).abs());
+        }
+        println!("Arbitrary GEMM {m}x{n}x{k} max_diff: {max_diff:e}");
+        assert!(max_diff < 1e-4, "GEMM max_diff too high: {max_diff:e}");
+    }
+
+    #[test]
+    fn smegemm_with_bias_relu() {
+        let m = 17;
+        let n = 19;
+        let k = 21;
+
+        let weights = vec![0.1f32; k * n];
+        let input = vec![1.0f32; m * k];
+        let bias = vec![-1.0f32; n]; // This should make some outputs negative before ReLU
+        let mut output = vec![0.0f32; m * n];
+        let mut expected = vec![0.0f32; m * n];
+
+        // Accelerate reference (GEMM then Bias then ReLU)
+        Accelerate::sgemm(m, n, k, &input, &weights, &mut expected);
+        for i in 0..m {
+            for j in 0..n {
+                expected[i * n + j] = (expected[i * n + j] + bias[j]).max(0.0);
+            }
+        }
+
+        let kernel = SmeGemm::new(m, n, k, &weights, Some(&bias), Activation::BiasReLU).expect("build kernel");
+        kernel.run_row_major(&input, &mut output);
+
+        let mut max_diff = 0.0f32;
+        for i in 0..(m * n) {
+            max_diff = max_diff.max((output[i] - expected[i]).abs());
+        }
+        println!("Arbitrary BiasReLU GEMM {m}x{n}x{k} max_diff: {max_diff:e}");
+        assert!(max_diff < 1e-4, "GEMM max_diff too high: {max_diff:e}");
+    }
+
+    #[test]
+    fn smemlp_arbitrary_widths() {
+        // 784 -> 31 -> 17 -> 10
+        let input_k = 784;
+        let w1 = vec![0.1f32; input_k * 31];
+        let b1 = vec![0.5f32; 31];
+        let w2 = vec![0.2f32; 31 * 17];
+        let b2 = vec![-0.1f32; 17];
+        let w3 = vec![0.3f32; 17 * 10];
+        let b3 = vec![0.0f32; 10];
+
+        let mut mlp = SmeMlp::new(input_k, &[
+            LayerConfig { n: 31, weights: w1.clone(), bias: b1.clone(), activation: Activation::BiasReLU },
+            LayerConfig { n: 17, weights: w2.clone(), bias: b2.clone(), activation: Activation::BiasReLU },
+            LayerConfig { n: 10, weights: w3.clone(), bias: b3.clone(), activation: Activation::Bias },
+        ]).expect("build mlp");
+
+        let input_row_major = vec![1.0f32; 16 * input_k];
+        let mut output = vec![0.0f32; 16 * 10];
+        mlp.run_row_major(&input_row_major, &mut output);
+
+        // Reference implementation (Accelerate per layer)
+        let mut h1 = vec![0.0f32; 16 * 31];
+        Accelerate::sgemm(16, 31, input_k, &input_row_major, &w1, &mut h1);
+        for i in 0..16 { for j in 0..31 { h1[i*31+j] = (h1[i*31+j] + b1[j]).max(0.0); } }
+
+        let mut h2 = vec![0.0f32; 16 * 17];
+        Accelerate::sgemm(16, 17, 31, &h1, &w2, &mut h2);
+        for i in 0..16 { for j in 0..17 { h2[i*17+j] = (h2[i*17+j] + b2[j]).max(0.0); } }
+
+        let mut expected = vec![0.0f32; 16 * 10];
+        Accelerate::sgemm(16, 10, 17, &h2, &w3, &mut expected);
+        for i in 0..16 { for j in 0..10 { expected[i*10+j] = expected[i*10+j] + b3[j]; } }
+
+        let mut max_diff = 0.0f32;
+        for i in 0..(16 * 10) {
+            max_diff = max_diff.max((output[i] - expected[i]).abs());
+        }
+        println!("Arbitrary MLP max_diff: {max_diff:e}");
+        assert!(max_diff < 1e-4, "MLP max_diff too high: {max_diff:e}");
+    }
 }

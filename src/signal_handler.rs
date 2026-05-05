@@ -7,17 +7,15 @@
 //!
 //! ## Recovery strategy
 //!
-//! All handlers use `siglongjmp` to restore the full CPU state (including SP,
-//! LR, callee-saved registers) from a `sigsetjmp` checkpoint. This handles
-//! **any** register clobbering by the probed instruction.
+//! Handlers use `siglongjmp` to restore the full CPU state (including SP, LR,
+//! callee-saved registers) from a `sigsetjmp` checkpoint, falling back to the
+//! legacy PC-redirect path (`redirect_pc_to_escape`) for the Gate 4 tests.
 //!
-//! The handlers run on an alternate signal stack (`SA_ONSTACK`) so they work
-//! even when the probed instruction has corrupted SP.
+//! Handlers run on an alternate signal stack (`SA_ONSTACK`) so they work even
+//! when the probed instruction has corrupted SP.
 //!
-//! ## Legacy support
-//!
-//! The PC-redirect approach (`redirect_pc_to_escape`) is kept for the Gate 4
-//! tests and the `install_sigill_handler` / `set_escape_address` API.
+//! In production, the fork-based `Probe` (see `probe.rs`) is the primary
+//! safety harness; this module is the in-process fallback.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -74,9 +72,6 @@ static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 /// Set to `true` by the SIGSEGV/SIGBUS handler when a memory fault occurs.
 static SEGFAULT_FIRED: AtomicBool = AtomicBool::new(false);
 
-/// Set to `true` by the SIGTRAP handler when a debug/breakpoint trap occurs.
-static TRAP_FIRED: AtomicBool = AtomicBool::new(false);
-
 /// Captured PC where the fault occurred.
 static FAULT_PC: AtomicU64 = AtomicU64::new(0);
 
@@ -116,7 +111,6 @@ pub fn install_signal_handlers() {
     install_handler(libc::SIGALRM, sigalrm_handler);
     install_handler(libc::SIGSEGV, sigsegv_handler);
     install_handler(libc::SIGBUS, sigsegv_handler);
-    install_handler(libc::SIGTRAP, sigtrap_handler);
 }
 
 /// Also expose the original name for backward compatibility with Gate 4.
@@ -280,28 +274,6 @@ extern "C" fn sigsegv_handler(
     }
 }
 
-/// `SIGTRAP` handler: set the trap flag and recover.
-///
-/// SIGTRAP is raised by BRK instructions (software breakpoints) and
-/// certain debug-related opcodes.
-extern "C" fn sigtrap_handler(
-    _sig: libc::c_int,
-    _info: *mut libc::siginfo_t,
-    ucontext: *mut libc::c_void,
-) {
-    let pc = capture_fault_pc(ucontext);
-    if USE_LONGJMP.load(Ordering::Relaxed) {
-        TRAP_FIRED.store(true, Ordering::Relaxed);
-        FAULT_PC.store(pc, Ordering::Relaxed);
-        siglongjmp_from_handler();
-    } else {
-        if !is_inside_probe(ucontext) { return; }
-        TRAP_FIRED.store(true, Ordering::Relaxed);
-        FAULT_PC.store(pc, Ordering::Relaxed);
-        redirect_pc_to_escape(ucontext);
-    }
-}
-
 /// Helper: extract the PC from a `ucontext_t`.
 fn capture_fault_pc(ucontext: *mut libc::c_void) -> u64 {
     unsafe {
@@ -351,7 +323,6 @@ pub fn clear_probe_flags() {
     SIGILL_FIRED.store(false, Ordering::Relaxed);
     TIMED_OUT.store(false, Ordering::Relaxed);
     SEGFAULT_FIRED.store(false, Ordering::Relaxed);
-    TRAP_FIRED.store(false, Ordering::Relaxed);
     FAULT_PC.store(0, Ordering::Relaxed);
 }
 
@@ -370,16 +341,6 @@ pub fn did_timeout() -> bool {
     TIMED_OUT.load(Ordering::Relaxed)
 }
 
-/// Check whether `SIGSEGV` or `SIGBUS` fired since the last call to [`clear_probe_flags`].
-pub fn did_segfault() -> bool {
-    SEGFAULT_FIRED.load(Ordering::Relaxed)
-}
-
-/// Check whether `SIGTRAP` fired since the last call to [`clear_probe_flags`].
-pub fn did_trap() -> bool {
-    TRAP_FIRED.load(Ordering::Relaxed)
-}
-
 /// Get the captured faulting PC.
 pub fn get_fault_pc() -> u64 {
     FAULT_PC.load(Ordering::Relaxed)
@@ -393,87 +354,6 @@ pub fn get_fault_pc() -> u64 {
 pub fn set_probe_bounds(start: u64, end: u64) {
     PROBE_START.store(start, Ordering::Relaxed);
     PROBE_END.store(end, Ordering::Relaxed);
-}
-
-// --- SIGINT (Ctrl+C) support ---
-
-/// Set to `true` by the SIGINT handler when Ctrl+C is pressed.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-/// Install a `SIGINT` handler that sets the [`INTERRUPTED`] flag.
-///
-/// The handler does *not* longjmp or abort — it simply sets a flag that
-/// sweep loops can poll via [`was_interrupted`].
-///
-/// # Panics
-/// Panics if `sigaction` fails.
-pub fn install_sigint_handler() {
-    // SAFETY: We install a minimal signal handler that only writes to an
-    // atomic bool. The handler is async-signal-safe.
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigint_handler as *const () as usize;
-        sa.sa_flags = libc::SA_SIGINFO;
-        libc::sigemptyset(&mut sa.sa_mask);
-
-        let ret = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        assert!(ret == 0, "sigaction(SIGINT) failed: {}", *libc::__error());
-    }
-}
-
-/// Minimal `SIGINT` handler — just sets the flag.
-extern "C" fn sigint_handler(
-    _sig: libc::c_int,
-    _info: *mut libc::siginfo_t,
-    _ucontext: *mut libc::c_void,
-) {
-    INTERRUPTED.store(true, Ordering::Relaxed);
-}
-
-/// Check whether Ctrl+C has been pressed since the last call to [`clear_interrupted`].
-pub fn was_interrupted() -> bool {
-    INTERRUPTED.load(Ordering::Relaxed)
-}
-
-/// Clear the interrupted flag.
-pub fn clear_interrupted() {
-    INTERRUPTED.store(false, Ordering::Relaxed);
-}
-
-// --- Timer helpers ---
-
-/// Arm a one-shot real-time alarm after `micros` microseconds.
-///
-/// When the timer fires, `SIGALRM` is delivered to the process, and
-/// our handler redirects execution to the escape address.
-pub fn arm_alarm(micros: u64) {
-    let secs = micros / 1_000_000;
-    let usecs = (micros % 1_000_000) as i32;
-
-    let it = libc::itimerval {
-        it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 }, // no repeat
-        it_value: libc::timeval {
-            tv_sec: secs as _,
-            tv_usec: usecs as _,
-        },
-    };
-
-    // SAFETY: `setitimer(ITIMER_REAL, ...)` is safe to call. It arms a
-    // one-shot alarm that delivers SIGALRM after the specified duration.
-    let ret = unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
-    debug_assert!(ret == 0, "setitimer failed");
-}
-
-/// Disarm the alarm timer. Call this after a probe returns successfully.
-pub fn disarm_alarm() {
-    let it = libc::itimerval {
-        it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 },
-        it_value: libc::timeval { tv_sec: 0, tv_usec: 0 }, // zero = disarm
-    };
-
-    // SAFETY: `setitimer` with zero values disarms the timer.
-    let ret = unsafe { libc::setitimer(libc::ITIMER_REAL, &it, std::ptr::null_mut()) };
-    debug_assert!(ret == 0, "setitimer (disarm) failed");
 }
 
 #[cfg(test)]
@@ -554,36 +434,5 @@ mod tests {
         assert!(did_sigill_fire(), "SIGILL should have fired for the UDFs");
     }
 
-    #[test]
-    #[ignore = "SIGALRM is process-directed; can be delivered to the wrong thread \
-                in the cargo test harness and hang. Run with: cargo test -- --ignored"]
-    fn timeout_recovers_from_hang() {
-        install_signal_handlers();
-
-        let page = JitPage::alloc(4096).expect("mmap should succeed");
-
-        // Emit: B . (branch to self — infinite loop) ; RET
-        // B . = 0x14000000 (branch +0, i.e., to self)
-        const BRANCH_TO_SELF: u32 = 0x1400_0000;
-        page.make_writable();
-        page.write_instruction(0, BRANCH_TO_SELF);
-        page.write_instruction(4, RET);
-        page.make_executable();
-
-        set_escape_address(page.as_ptr() as u64 + 4);
-        clear_probe_flags();
-
-        // Arm a 10ms timeout.
-        arm_alarm(10_000);
-
-        // SAFETY: Branch-to-self will loop forever, but SIGALRM will fire
-        // after 10ms and redirect PC to the RET.
-        unsafe { page.call_void(); }
-
-        disarm_alarm();
-
-        assert!(!did_sigill_fire(), "should not have SIGILLed");
-        assert!(did_timeout(), "should have timed out on branch-to-self");
-    }
 }
 

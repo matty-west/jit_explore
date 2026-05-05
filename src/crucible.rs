@@ -36,3 +36,28 @@ unsafe extern "C" {
         ldc:     c_int,
     );
 }
+
+pub struct Accelerate;
+
+impl Accelerate {
+    pub fn sgemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        unsafe {
+            cblas_sgemm(
+                CblasOrder::RowMajor,
+                CblasTranspose::NoTrans,
+                CblasTranspose::NoTrans,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                1.0,
+                a.as_ptr(),
+                k as c_int,
+                b.as_ptr(),
+                n as c_int,
+                0.0,
+                c.as_mut_ptr(),
+                n as c_int,
+            );
+        }
+    }
+}

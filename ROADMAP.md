@@ -2,15 +2,13 @@
 
 ## Where We Are
 
-Gates 0–24, 26–27, 27.5 are complete. We have transitioned from the **Discovery Phase** (empirical probing) to the **Maturation Phase** (API stability and architectural scaling).
+Gates 0–24, 26–28 are complete. We have transitioned from the **Discovery Phase** (empirical probing) through the **Maturation Phase** (API stability) and are now entering the **Sequence Phase** — building the primitives needed for modern small-model inference (transformers, SSMs, RNNs).
 
 ### Status Summary
 - **Proven Performance:** 1.55× faster than Accelerate for full MNIST MLPs; 5.1× for 16×16 tiles.
-- **Architectural Milestone:** Successfully implemented monolithic kernel fusion and zero-transpose vertical stores.
-- **Codebase Maturation (Active):**
-    - `main.rs` refactored to remove ~1500 lines of historical discovery bloat.
-    - Identification of obsolete research code in `crucible.rs`, `inference.rs`, and `probe.rs` for trimming.
-    - Deprecation of systematic discovery tools (`sink.rs`) as focus shifts to model primitives.
+- **Architectural Milestone:** Monolithic kernel fusion, zero-transpose vertical stores, and arbitrary M×N×K via WHILELT-predicated edge tiles (Gate 28).
+- **Strategic Pivot (post-Gate-28):** Multi-threading was dropped from the roadmap after we confirmed our niche is *zero-dispatch low-latency batch=1 inference* — fighting Accelerate at large GEMM is its home turf. The new direction is sequence-model primitives, with **GEMV first** (because batch=1 ZA tile utilization is currently 6%) followed by horizontal reductions (Softmax/Norms) and SSM/Mamba scans.
+- **Codebase Maturation (Active):** Trimmed `signal_handler.rs` (SIGTRAP/SIGINT handlers, timer helpers, dead flag getters) and `emitter.rs` (`build_layer_kernel`, `ESTIMATED_OVERHEAD_BYTES`, ~10 inline-hex sites collapsed to shared `PTRUE_P2_S`/`PTRUE_P3_S`/`DUP_Z4_ZERO` constants).
 
 ### Functional Progress
 - A working JIT harness (MAP_JIT, fork isolation, GPR snapshots)
@@ -402,9 +400,9 @@ let mut mlp = SmeMlp::new(784, &[
 mlp.run(&input_col_major, &mut output);
 ```
 
-## Phase 2: Edge & Sequence Horizons (Gates 26–32)
+## Phase 2: Edge Tiles (Gates 26–28, complete)
 
-With the foundational 16-multiple MLPs proven, the next phase targets arbitrary matrix sizes, multi-core scaling, and sequence model primitives (Transformers, RNNs, SSMs).
+Phase 2 broke the 16-multiple constraint via SVE `WHILELT` predicate generation and confirmed that arbitrary M×N×K runs correctly on M4 SME despite two undocumented hardware quirks (FMOPA P1-corruption when same-pred used as row+col; predicated ZA-store irregularity). All three gates landed with `max_diff = 0.0` vs Accelerate.
 
 ### Gate 26: Predicated Memory & Generation (Complete)
 **Goal:** Emit SVE `WHILELT` instructions to generate dynamic predicate masks for edge bounds, and ensure `LD1W`/`ST1W` respect these masks.
@@ -474,25 +472,45 @@ Parametric encoder for `FMOPA ZAda.S, Pn/M, Pm/M, Zn.S, Zm.S`. Replaces four har
 - Predicated `ST1W ZA0H, P_col` correctly writes only the active columns — no P0-store+trim workaround needed.
 - The two main risks blocking Gate 28 are resolved. Proceed.
 
-### Gate 28: Arbitrary Tiled GEMM
+### Gate 28: Arbitrary Tiled GEMM (Complete)
 **Goal:** Integrate Gates 26 and 27 into the main `SmeGemm` tiled architecture.
-**Success:** `max_diff = 0.0` vs Accelerate for arbitrary M×N×K (e.g., 17×43×91) without physical memory padding.
+**Status:** ✅ **Complete.**
+**Results:**
+- `max_diff = 0.0` vs Accelerate for arbitrary M×N×K (e.g., 17×43×91) and multiple tiles (33×33×33).
+- `SmeMlp` correctly supports non-multiple-of-16 hidden layers (verified with 31→17→10 hidden dims).
+- Integrated `WHILELT` based predicate generation for all edge tiles.
+- Workaround for M4 hardware bug (separate row/col predicates) integrated into both `SmeGemm` and `SmeMlp`.
 
-### Gate 29: Multi-threading & P-Core Pinning
-**Goal:** Dispatch large GEMMs across multiple P-cores to surpass Accelerate at ≥64×64.
-**Success:** Multi-threaded JIT beats Accelerate at 128×128.
+## Phase 3: Sequence Horizons (Gates 29–31, post-pivot)
 
-### Gate 30: Tiny-Transformer Primitives
-**Goal:** Implement SVE-based Softmax approximation and LayerNorm/RMSNorm (horizontal reductions).
-**Success:** Execute a single Self-Attention block ($Q K^T V$) natively inside the JIT.
+After Gate 28, the roadmap was reordered. The original Gate 29 (multi-threading & P-core pinning) was deferred — multi-threaded large-GEMM is Accelerate's home turf, and the dispatch overhead it introduces directly contradicts our zero-dispatch latency niche. The new sequence puts **GEMV first** because batch=1 inference (autoregressive decode, RNN state, single-token attention) is the workload our envelope actually serves, and the 16×16 ZA tile is currently only ~6% utilized at M×1.
 
-### Gate 31: RNN / GEMV Specialized Kernel
-**Goal:** Optimize a pure Matrix-Vector ($M \times 1$) kernel for sequence state updates without wasting ZA tiles.
-**Success:** 10× speedup over framework dispatch for a batch-size=1 recurrent state update.
+### Gate 29: GEMV / Batch=1 Kernels
+**Goal:** Make M×1 matrix-vector efficient on M4 SME without wasting the 16×16 ZA tile. Two design candidates:
+- **(a) Pure SVE FMLA path** — accumulate into Z registers using `FMLA Zda.S, Pg/M, Zn.S, Zm.S` and reduce with `FADDV`, bypassing ZA entirely. Best for true M×1.
+- **(b) Batched-rank-1 packing** — pack 16 distinct hidden-state vectors into one ZA tile and amortize FMOPA across them. Best for batched decode (multiple tokens or beam-search heads).
 
-### Gate 32: SSM / Mamba Primitives
-**Goal:** Emit 1D causal convolutions (`EXT` sliding windows) and hardware-aware associative parallel scans.
-**Success:** JIT-compiled execution of a minimal Mamba block.
+**Encoder prerequisites** (must be added with clang-verified reference values, mirroring the pattern from `encode_sve_whilelt_s` in Gate 26 and `encode_sme_fmopa` in Gate 27):
+- `encode_sve_fmla_pred_vec(zda, pg, zn, zm)` — predicated multiply-accumulate on Z registers.
+- `encode_sve_faddv_s(vd, pg, zn)` — horizontal sum reduction (also unblocks Softmax denominator and LayerNorm mean in Gate 30).
+- `encode_sve_fmaxv_s(vd, pg, zn)` — horizontal max reduction (Softmax stabilization in Gate 30).
+
+**Success:** GEMV at K∈{16, 64, 256, 1024} with `max_diff = 0.0` vs Accelerate `cblas_sgemv`, and ≥3× speedup at K≤256 where dispatch dominates. `SmeGemv` public type added to the `api` module alongside `SmeGemm`.
+
+### Gate 30: Tiny-Transformer Primitives (Softmax + Norms)
+**Goal:** Implement the *glue* operations a transformer needs to stay inside the JIT envelope without falling back to Rust scalar code:
+- **Softmax** — exp approximation in SVE (e.g. via polynomial or piecewise) + `FMAXV` for stability + `FADDV` for the denominator.
+- **LayerNorm / RMSNorm** — `FADDV` for the mean, FMA accumulation for the variance, broadcast scale/bias.
+
+These are the operations that, combined with Gate 29's GEMV, allow a full self-attention block to execute as one fused JIT routine.
+
+**Open design question** carried from the audit: do Softmax/Norms compose with the existing `Activation` enum (currently `{None, ReLU, Bias, BiasReLU}`), or do they need a separate `Norm`/`Epilogue` family? Decide as part of this gate.
+
+**Success:** Single self-attention block (Q·K^T → scaled-Softmax → ·V) executes inside one streaming-mode page with `max_diff ≤ 1e-4` vs an Accelerate-built reference.
+
+### Gate 31: SSM / Mamba Primitives
+**Goal:** Emit 1D causal convolutions (`EXT` sliding windows) and hardware-aware associative parallel scans for state-space models.
+**Success:** A minimal Mamba block executes inside the JIT envelope with correctness vs a CPU reference.
 
 ## Codebase Cleanup (Ongoing)
 
@@ -504,6 +522,8 @@ As the project matures, we are trimming research-phase artifacts to focus on per
 - [x] Remove `sink.rs` — JSONL sweep logger deleted entirely.
 - [x] Trim `emitter.rs` — removed `build_sme_bfmopa_16x16`, `build_sme_smopa_16x16`, `build_sme_sgemm_page_cached`, and all dead encoders (BFMOPA/SMOPA/UMOPA/SUMOPA, MOVA, LDP_X). Net: −250 lines.
 - [x] Delete `weights.rs` — only `inference.rs` consumed it; both removed together.
+- [x] **Post-Gate-28 trim:** Removed `build_layer_kernel` (305 lines, dead since monolithic kernel fusion) and `ESTIMATED_OVERHEAD_BYTES` (dead constant). Trimmed `signal_handler.rs` of SIGTRAP handler, SIGINT support, `arm_alarm`/`disarm_alarm` timer helpers, and the `did_segfault`/`did_trap` flag getters that had no callers (~150 lines). Promoted `PTRUE_P2_S`, `PTRUE_P3_S`, `DUP_Z4_ZERO` to module-level constants and replaced ~10 inline hex sites.
+- [ ] **Identified for follow-up cleanup:** `cpu_state.rs` has discovery-era diff tooling (`RegDiff`, `GprSnapshot::diff`, `seeded_snapshot`) that is only exercised by the module's own tests; cleanup deferred until those tests are themselves reviewed.
 
 ## Deferred (from original roadmap)
 
@@ -517,6 +537,10 @@ These items are deprioritized but not abandoned:
 | Batched small-SGEMM | — | Deferred — build after fused kernels prove out |
 | Single SM session across layers | — | ✅ **Done** — Gate 23 |
 | Column-major inter-layer stores | — | ✅ **Done** — Gate 23 (vertical ST1W) |
+| Multi-threading & P-core dispatch | original Gate 29 | **Deferred (post-Gate-28 pivot)** — fights Accelerate's optimized large-GEMM home turf and contradicts the zero-dispatch low-latency thesis. Revisit only if a batched-serving workload demands it. |
+| Standalone "RNN / GEMV specialized kernel" | original Gate 31 | **Absorbed into new Gate 29** — GEMV is now the leading post-Gate-28 gate, not a downstream specialization. |
+| Kernel cache / JitPage pool | — | Deferred — flagged by audit; defer until many small kernels (Gates 30–31) actually exist. |
+| `SmeMlp` batch parameterization (variable batch beyond 16) | — | Deferred — design as part of Gate 29 once GEMV API shape is settled. |
 
 ## Non-Goals (Archived)
 
